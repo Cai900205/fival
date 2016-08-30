@@ -1,0 +1,825 @@
+Index: include/dfv/dfv_intf.h
+===================================================================
+--- include/dfv/dfv_intf.h	(revision 80)
++++ include/dfv/dfv_intf.h	(working copy)
+@@ -4,8 +4,9 @@
+ 
+ #define DFV_MOD_VER     "0.9.151230"
+ 
+-#define DFV_MAX_REPOS   (4) // max repos in vault
++#define DFV_MAX_REPOS   (16) // max repos in vault
+ #define DFV_MAX_SLOTS   (999)
++#define DFV_PIPE_MAX_REPOS   (8)
+ 
+ typedef struct
+ {
+@@ -28,8 +29,9 @@
+ 
+ typedef struct
+ {
+-    struct dfv_repo* repo;
++    struct dfv_repo* repo[DFV_PIPE_MAX_REPOS];
+     int slot_id;
++    int slot_repo_num;
+ } dfv_slot_def_t;
+ 
+ int dfv_module_init(const char* log_cat);
+Index: include/spark.h
+===================================================================
+--- include/spark.h	(revision 80)
++++ include/spark.h	(working copy)
+@@ -177,4 +177,38 @@
+     fprintf(stderr, "exec cmd: cmd=\'%s\'\n", cmd);
+     return(system(cmd));
+ }
++
++static inline int spk_get_core_num(uint32_t core_set)
++{
++    int count = 0;
++    while (core_set) {
++        count ++;
++        core_set = core_set & (core_set -1);
++    }
++    return count;
++}
++
++static inline uint32_t spk_alloc_core(uint32_t *core_set, int core_num)
++{
++    int i = 0;
++    uint32_t alloc_num = 0;
++    
++    alloc_num = *core_set;
++    for (i=0; i<core_num; i++) {
++        *core_set = (*core_set) & (*core_set -1);
++    }
++    alloc_num = (alloc_num - *core_set);
++    return alloc_num;
++}
++
++static inline int spk_get_cpubase(uint32_t core_set)
++{
++    int cpu_base = 0;
++    
++    while (core_set) {
++        cpu_base++;
++        core_set=(core_set>>1);
++    }
++    return  cpu_base;
++}
+ #endif
+Index: src/testapp/ips_tb/dual_slave.c
+===================================================================
+--- src/testapp/ips_tb/dual_slave.c	(revision 80)
++++ src/testapp/ips_tb/dual_slave.c	(working copy)
+@@ -22,7 +22,7 @@
+ 
+ #define WORK_CPU_BASE   (22)
+ 
+-#define PIPE_NUM    (2)
++#define PIPE_NUM    (1)
+ ips_linkdesc_t link_desc_tbl[PIPE_NUM];
+ pthread_t wkr[PIPE_NUM];
+ static pthread_mutex_t sync_cnt_lock;
+@@ -112,9 +112,11 @@
+         hb_tick = now + 2000;
+ 
+         sync_cnt_local++;
++      /*
+         while ((sync_cnt % 2) != wkr_id && !break_req) {
+             usleep(10);
+         }
++      */
+         sync_cnt++;
+ 
+         assert(write_ret == tx_sz);
+@@ -255,19 +257,19 @@
+     if(ret != -1) {
+         test_ips_mode.dma_use_nlwr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:tx_wptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:tx_use_wptr", -1);
+     if(ret != -1) {
+         test_ips_mode.tx.use_wptr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:tx_rptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:tx_use_rptr", -1);
+     if(ret != -1) {
+         test_ips_mode.tx.use_rptr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:rx_wptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:rx_use_wptr", -1);
+     if(ret != -1) {
+         test_ips_mode.rx.use_wptr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:rx_rptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:rx_use_rptr", -1);
+     if(ret != -1) {
+         test_ips_mode.rx.use_rptr = ret;
+     }
+@@ -290,13 +292,13 @@
+     link_desc_tbl[0].mst_port = 6;
+     link_desc_tbl[0].slv_port = 1;
+     link_desc_tbl[0].is_master = 0;
+-    
++/*    
+     link_desc_tbl[1].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 0x1);
+     link_desc_tbl[1].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 0x1);
+     link_desc_tbl[1].mst_port = 3;
+     link_desc_tbl[1].slv_port = 4;
+     link_desc_tbl[0].is_master = 0;
+-    
++ */  
+     pthread_barrier_init(&barrier, NULL, PIPE_NUM);
+     sync_cnt = 0;
+     pthread_mutex_init(&sync_cnt_lock, NULL);
+Index: src/syslk/syslk_job.c
+===================================================================
+--- src/syslk/syslk_job.c	(revision 80)
++++ src/syslk/syslk_job.c	(working copy)
+@@ -135,6 +135,7 @@
+         dfv_file_close(file_ctx);
+         file_ctx = NULL;
+ 
++/*need change*/
+         // do interlace while copy data
+         for (j=0; j<cache_sz_repo/interlace_sz; j++) {
+             memcpy(file_cache->data+(j*repo_num+i)*interlace_sz,
+@@ -218,14 +219,30 @@
+     int ret = -1;
+ #ifdef ARCH_ppc64
+     struct ips_pcctx* pcctx = NULL;
++#if 1
++    struct dfv_file* file_ctx[SYS_PIPE_REPO_NUM] = {NULL};
++#else
+     struct dfv_file* file_ctx = NULL;
++#endif
+     int wkr_id = wkr_ctx->wkr_id;
+     spk_stats_t* stats = &wkr_ctx->stats;
+ 
+     void* chunk_buf = NULL;
+-    size_t chunk_size = slice_def->size * slice_def->num;
+-    int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
+-
++    size_t chunk_size = (slice_def->size * slice_def->num * slot_def->slot_repo_num);
++    uint32_t dfv_cpu_base = 0x0007f800;//12+4*wkr_ctx->wkr_id;
++#if 1
++    int repo_num = 0;
++    int slot_repo_num = slot_def->slot_repo_num;
++    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++        zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
++                        "slice={%d, 0x%lx}, cpu_base=%d}",
++                        wkr_id,
++                        src_id, pc_id,
++                        dfv_repo_get_id(slot_def->repo[repo_num]), slot_def->slot_id,
++                        slice_def->num, slice_def->size,
++                        dfv_cpu_base);
++    }
++#else
+     zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
+                         "slice={%d, 0x%lx}, cpu_base=%d}",
+                         wkr_id,
+@@ -233,10 +250,32 @@
+                         dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
+                         slice_def->num, slice_def->size,
+                         dfv_cpu_base);
++#endif
+ 
+     // reset stats
+     spk_stats_reset(stats);
+-
++#if 1
++    uint32_t total_cpu_base = dfv_cpu_base;
++    int total_cpu_cnt = spk_get_core_num(total_cpu_base);
++    int repo_cpu_cnt = (total_cpu_cnt / slot_repo_num);
++    int reside_cpu_cnt = 0;
++   
++    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++        uint32_t repo_cpu_base = spk_alloc_core(&total_cpu_base, repo_cpu_cnt);
++        reside_cpu_cnt = spk_get_core_num(total_cpu_base);
++        if(reside_cpu_cnt < repo_cpu_cnt) {
++            total_cpu_base = dfv_cpu_base;
++        }    
++        file_ctx[repo_num] = dfv_file_open(slot_def->repo[repo_num], 
++                             slot_def->slot_id, SPK_DIR_WRITE, slice_def, 
++                             repo_cpu_base);
++        if (!file_ctx[repo_num]) {
++            zlog_fatal(sys_zc, "wkr#%d> failed to open dfv file", wkr_id);
++            ret = SPKERR_BADRES;
++            goto out;
++        }
++    }
++#else 
+     // open dfv slot
+     file_ctx = dfv_file_open(slot_def->repo, slot_def->slot_id, SPK_DIR_WRITE, slice_def,
+                              dfv_cpu_base);
+@@ -246,7 +285,9 @@
+         goto out;
+     }
+ 
++#endif
+     // write to dfv
++#if 0
+     if (!(sys_env.dbg_flag & SYSDBG_REC_NOTSAVE2DISK)) {
+         size_t warmup_sz = 128*1024*1024;
+         size_t xferred = 0;
+@@ -256,6 +297,25 @@
+         assert(txbuf);
+         memset(txbuf, 0xfe, DFV_CHUNK_SIZE);
+         while(xferred < warmup_sz) {
++#if 1
++            for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++                ssize_t xfer = dfv_file_write(file_ctx[repo_num], 
++                            (txbuf + (REPO_DFV_CHUNK_SIZE*repo_num)), REPO_DFV_CHUNK_SIZE);
++                if (xfer != REPO_DFV_CHUNK_SIZE) {
++                    zlog_fatal(sys_zc, "wkr#%d> failed to write to dfv: xfer=%ld, expect=%u",
++                                        wkr_id, xfer, DFV_CHUNK_SIZE);
++                    ret = SPKERR_EACCESS;
++                    SAFE_RELEASE(txbuf);
++                    goto out;
++                }
++                xferred += xfer;
++            }
++        }
++
++        for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++            dfv_file_seek(file_ctx[repo_num], 0);
++        }
++#else
+             ssize_t xfer = dfv_file_write(file_ctx, txbuf, DFV_CHUNK_SIZE);
+             if (xfer != DFV_CHUNK_SIZE) {
+                 zlog_fatal(sys_zc, "wkr#%d> failed to write to dfv: xfer=%ld, expect=%u",
+@@ -267,11 +327,12 @@
+             xferred += xfer;
+         }
+         dfv_file_seek(file_ctx, 0);
++#endif
+         SAFE_RELEASE(txbuf);
+     }
+     zlog_notice(sys_zc, "wkr#%d> dfv warmup done", wkr_id);
++#endif
+ 
+-
+     // open ips srio
+     pcctx = ips_chan_open(src_id, pc_id);
+     if (!pcctx) {
+@@ -312,7 +373,16 @@
+             if (sys_env.dbg_flag & SYSDBG_REC_NOTSAVE2DISK) {
+                 xfer = chunk_size;
+             } else {
++#if 1
++                xfer = 0;
++                ssize_t repo_size = (read_size / slot_repo_num);
++                for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++                    xfer += dfv_file_write(file_ctx[repo_num], 
++                        (chunk_buf + (repo_size * repo_num)), repo_size);
++                }
++#else
+                 xfer = dfv_file_write(file_ctx, chunk_buf, read_size);
++#endif
+             }
+ 
+             // notify ips to free buffer first
+@@ -397,7 +467,16 @@
+             if (sys_env.dbg_flag & SYSDBG_REC_NOTSAVE2DISK) {
+                 xfer = tail_size;
+             } else {
++#if 1
++                xfer = 0;
++                ssize_t repo_size = (tail_size / slot_repo_num);
++                for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++                    xfer += dfv_file_write(file_ctx[repo_num], 
++                        (chunk_buf + (repo_size * repo_num)), repo_size);
++                }
++#else
+                 xfer = dfv_file_write(file_ctx, chunk_buf, tail_size);
++#endif
+             }
+             ips_chan_free_buf(pcctx, tail_size);
+             if (xfer != tail_size) {
+@@ -421,13 +500,20 @@
+                             wkr_id, spk_stats_get_time_elapsed(stats)/1000,
+                             stats->xfer.pkts, stats->xfer.bytes, stats->overflow.bytes);
+     }
+-
++#if 1
++    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++        if (file_ctx[repo_num]) {
++            dfv_file_close(file_ctx[repo_num]);
++            file_ctx[repo_num] = NULL;
++        }
++    }
++#else
+     // close dfv slot
+     if (file_ctx) {
+         dfv_file_close(file_ctx);
+         file_ctx = NULL;
+     }
+-
++#endif
+     // close ips srio
+     if (pcctx) {
+         ips_chan_close(pcctx);
+@@ -489,15 +575,27 @@
+     void * txbuf = NULL;
+     size_t txbuf_sz = 0;
+     int i;
+-    int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
++    uint32_t dfv_cpu_base = 0x0007f800;//12+4*wkr_ctx->wkr_id;
++    //int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
+ 
++#if 1
++    int repo_num = 0;
++    for (repo_num = 0; repo_num < slot_def->slot_repo_num; repo_num++) {
++        zlog_notice(sys_zc, "wkr#%d> prepare for playback: ips={0x%x:%d}, "
++                        "dfv={repo={%d:%d}, sz=%lu, cpu_base=%d}",
++                        wkr_id,
++                        src_id, pc_id,
++                        dfv_repo_get_id(slot_def->repo[repo_num]), slot_def->slot_id,
++                        slot_sz, dfv_cpu_base);
++    }
++#else
+     zlog_notice(sys_zc, "wkr#%d> prepare for playback: ips={0x%x:%d}, "
+                         "dfv={repo={%d:%d}, sz=%lu, cpu_base=%d}",
+                         wkr_id,
+                         src_id, pc_id,
+                         dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
+                         slot_sz, dfv_cpu_base);
+-
++#endif
+     // reset stats
+     spk_stats_reset(stats);
+ 
+@@ -563,7 +661,7 @@
+         }
+         dfv_bufq_node_t* node = dfv_bufq_dequeue(dfvcm_get_workq(dfvcm));
+         if (syslk_ips_mode.dma_use_chain) {
+-            if(current_buf_num <= 4) {
++            if(current_buf_num <= (DFVCM_BUF_NODE_NUM/2)) {
+                 int free_buf_num = ips_chan_get_tx_freebn(pcctx, DFV_CHUNK_SIZE);
+                 if(free_buf_num > 0) {
+                     for(i=0; i<free_buf_num; i++) {
+@@ -718,7 +816,9 @@
+     IPS_EPID epid = pcdesc->src_id;
+ 
+     dfv_vault_t* vault = ctx->vault;
++#if 0
+     struct dfv_repo* repo = vault->repo_tbl[dfv_pipe_id];
++#endif
+     size_t ips_sec_sz = pcdesc->sector_sz;
+ 
+     dfv_slice_def_t slice_def;
+@@ -759,7 +859,17 @@
+             // start_rec: deferred job
+             int slot_id = (int)(intptr_t)job_node->arg;
+             memset(&slot_def, 0, sizeof(dfv_slot_def_t));
++#if 1
++            int repo_num;
++            int repo_id = (dfv_pipe_id * SYS_PIPE_REPO_NUM);
++            for (repo_num=0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
++                slot_def.repo[repo_num] = vault->repo_tbl[repo_id];
++                repo_id++;
++            }
++            slot_def.slot_repo_num = SYS_PIPE_REPO_NUM;
++#else
+             slot_def.repo = repo;
++#endif
+             slot_def.slot_id = slot_id;
+             __JOB_RESPONSE(sys_state_rec, SPK_SUCCESS);
+             spk_stats_reset(&wkr_ctx->stats);
+@@ -774,7 +884,17 @@
+             __JOB_RESPONSE(sys_state_play, SPK_SUCCESS);
+             spk_stats_reset(&wkr_ctx->stats);
+             memset(&slot_def, 0, sizeof(dfv_slot_def_t));
++#if 1
++            int repo_num;
++            int repo_id = (dfv_pipe_id * SYS_PIPE_REPO_NUM);
++            for (repo_num=0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
++                slot_def.repo[repo_num] = vault->repo_tbl[repo_id];
++                repo_id++;
++            }
++            slot_def.slot_repo_num = SYS_PIPE_REPO_NUM;
++#else
+             slot_def.repo = repo;
++#endif
+             slot_def.slot_id = slot_id;
+             ret = __sys_job_do_playback(wkr_ctx,
+                                         epid, ips_pcid, ips_sec_sz,
+Index: src/syslk/syslk.c
+===================================================================
+--- src/syslk/syslk.c	(revision 80)
++++ src/syslk/syslk.c	(working copy)
+@@ -358,6 +358,9 @@
+ 
+     fclose(fp);
+ }
++#if 1
++    const char* dfv_name[8] = {"sdb","sdc","sdd","sde","sdf","sdg","sdh","sdi"};
++#endif
+ 
+ int main(int argc, char **argv)
+ {
+@@ -417,24 +420,25 @@
+     sys_env.dfv_desc_tbl[0].mnt_path = "dfa";
+     sys_env.dfv_desc_tbl[0].dev_path = "scta";
+     sys_env.dfv_desc_tbl[0].flag = 0;
++/*    
+     sys_env.dfv_desc_tbl[1].mnt_path = "dfb";
+     sys_env.dfv_desc_tbl[1].dev_path = "sctb";
+     sys_env.dfv_desc_tbl[1].flag = 0;
+-
++ */
+     sys_env.ips_linkdesc_tbl[0].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 0);
+     sys_env.ips_linkdesc_tbl[0].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 0);
+     sys_env.ips_linkdesc_tbl[0].mst_port = 1;
+     sys_env.ips_linkdesc_tbl[0].slv_port = 6;
+     sys_env.ips_linkdesc_tbl[0].is_master = 1;
+-
++/*
+     sys_env.ips_linkdesc_tbl[1].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 1);
+     sys_env.ips_linkdesc_tbl[1].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 1);
+     sys_env.ips_linkdesc_tbl[1].mst_port = 4;
+     sys_env.ips_linkdesc_tbl[1].slv_port = 3;
+     sys_env.ips_linkdesc_tbl[1].is_master = 1;
+-
++*/
+     assert(sys_env.ips_linkdesc_tbl[0].is_master); // I am master
+-    assert(sys_env.ips_linkdesc_tbl[1].is_master); // I am master
++  //  assert(sys_env.ips_linkdesc_tbl[1].is_master); // I am master
+ 
+     sys_env.ips_desc_tbl[0].capacity = 0;
+     sys_env.ips_desc_tbl[0].pc_num = 1;
+@@ -445,7 +449,7 @@
+         pcdesc->sector_sz = IPS_CLS_SECTOR_SIZE;
+         pcdesc->sector_num = IPS_CLS_SECTOR_NUM;
+     }
+-
++/*
+     sys_env.ips_desc_tbl[1].capacity = 0;
+     sys_env.ips_desc_tbl[1].pc_num = 1;
+     for (i = 0; i < 1; i++) {
+@@ -455,7 +459,7 @@
+         pcdesc->sector_sz = IPS_CLS_SECTOR_SIZE;
+         pcdesc->sector_num = IPS_CLS_SECTOR_NUM;
+     }
+-
++*/
+     // initialize each module
+     zlog_notice(sys_zc, "==> initializing modules ...");
+ #ifdef ARCH_ppc64
+@@ -479,6 +483,7 @@
+     memset(&sys_ctx, 0, sizeof(sys_ctx));
+ 
+     zlog_notice(sys_zc, "==> initializing storage ...");
++#if 0
+     const char* repo_mnt_tbl[DFV_MAX_REPOS] = {NULL};
+     const char* repo_dev_tbl[DFV_MAX_REPOS] = {NULL};
+     for (i=0; i<SYS_MAX_PIPES; i++) {
+@@ -490,6 +495,20 @@
+         zlog_fatal(sys_zc, "failed to initializing storage, quit");
+         exit(-1);
+     }
++#else
++    const char* repo_mnt_tbl[SYS_TOTAL_REPO_NUM] = {NULL};
++    const char* repo_dev_tbl[SYS_TOTAL_REPO_NUM] = {NULL};
++    for (i=0; i<SYS_TOTAL_REPO_NUM; i++) {
++        repo_mnt_tbl[i] = dfv_name[i]; 
++        repo_dev_tbl[i] = dfv_name[i];
++        zlog_notice(sys_zc, "==> repo_index:%d name:%s", i, dfv_name[i]);
++    }
++    sys_ctx.vault = dfv_vault_open(SYS_TOTAL_REPO_NUM, repo_mnt_tbl, repo_dev_tbl, 0);
++    if (!sys_ctx.vault) {
++        zlog_fatal(sys_zc, "failed to initializing storage, quit");
++        exit(-1);
++    }
++#endif
+     sys_ctx.diskcap = dfv_vault_get_diskcap(sys_ctx.vault);
+     // check freeslot
+     int slot_id = dfv_vault_get_freeslot(sys_ctx.vault);
+Index: src/syslk/syslk_cmd.c
+===================================================================
+--- src/syslk/syslk_cmd.c	(revision 80)
++++ src/syslk/syslk_cmd.c	(working copy)
+@@ -362,7 +362,15 @@
+ 
+         struct dfvcm_ctx* dfvcm = NULL;
+         dfv_slot_def_t slot_def;
++#if 1
++        int repo_num = 0;
++
++        for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
++            slot_def.repo[repo_num] = dfv_vault_get_repo(ctx->vault, ((i * SYS_PIPE_REPO_NUM)+repo_num));
++        }
++#else
+         slot_def.repo = dfv_vault_get_repo(ctx->vault, i);
++#endif
+         slot_def.slot_id = slot_id;
+ 
+         dfv_slice_def_t slice_def;
+Index: src/syslk/syslk.h
+===================================================================
+--- src/syslk/syslk.h	(revision 80)
++++ src/syslk/syslk.h	(working copy)
+@@ -13,15 +13,18 @@
+ #define SYS_VERSION         MAKE_VER_STR(SYS_VERSION_MAJOR, SYS_VERSION_MINOR, SYS_VERSION_DATE)
+ #define SYS_VERSION_INT     MAKE_VER_INT(SYS_VERSION_MAJOR, SYS_VERSION_MINOR, SYS_VERSION_DATE)
+ 
+-#define SYS_MAX_PIPES       (2)
++#define SYS_MAX_PIPES       (1)
+ #define IPS_CLS_SECTOR_NUM  (4096) 
+ #define IPS_CLS_SECTOR_SIZE (0x10000)
+ 
+ #define DFV_SLICE_SIZE      (4*1024*1024)
+-#define DFV_SLICE_NUM       (4)
+-#define DFV_CHUNK_SIZE      (DFV_SLICE_SIZE*DFV_SLICE_NUM)
++#define DFV_SLICE_NUM       (1)
++#define SYS_PIPE_REPO_NUM   (8)
++#define SYS_TOTAL_REPO_NUM  (SYS_MAX_PIPES * SYS_PIPE_REPO_NUM)
++#define REPO_DFV_CHUNK_SIZE (DFV_SLICE_SIZE*DFV_SLICE_NUM)
++#define DFV_CHUNK_SIZE      (REPO_DFV_CHUNK_SIZE*SYS_PIPE_REPO_NUM)
+ 
+-#define DFVCM_BUF_NODE_NUM  (8)
++#define DFVCM_BUF_NODE_NUM  (4)
+ #define SYS_CACHE_SIZE      (DFV_CHUNK_SIZE*SYS_MAX_PIPES)
+ 
+ #define SYS_INTERLACE_SIZE  (4*1024)
+Index: src/libdfv/dfv_cm.c
+===================================================================
+--- src/libdfv/dfv_cm.c	(revision 80)
++++ src/libdfv/dfv_cm.c	(working copy)
+@@ -17,8 +17,15 @@
+ {
+     dfvcm_ctx_t* ctx = (dfvcm_ctx_t*)args;
+     size_t slot_sz = ctx->slot_sz;
++#if 1
++    dfv_file_t* file[DFV_PIPE_MAX_REPOS];
++    int repo_num = 0;
++    int slot_repo_num = ctx->slot_repo_num;
++    size_t xfer_repo_req = 0;
++#else
+     dfv_file_t* file = ctx->file;
+     spk_stats_t* stats = dfv_file_get_stats(file);
++#endif
+     dfv_bufq_node_t* node = NULL;
+     uint64_t xferred = 0;
+     ssize_t xfer_sz = 0;
+@@ -36,7 +43,17 @@
+                 continue;
+             }
+             xfer_req = MIN(slot_sz-xferred, node->buf_sz);
++#if 1
++            xfer_sz = 0;
++            xfer_repo_req = (xfer_req / slot_repo_num);
++            for(repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++                file[repo_num] = ctx->file[repo_num];
++                xfer_sz += dfv_file_read(file[repo_num], 
++                           (node->buf_ptr + (repo_num * xfer_repo_req)), xfer_repo_req);
++            }
++#else
+             xfer_sz = dfv_file_read(file, node->buf_ptr, xfer_req);
++#endif
+             if (xfer_sz != xfer_req) {
+                 dfv_bufq_enqueue(&ctx->freeq, node);
+                 ctx->eof = -1;
+@@ -59,7 +76,17 @@
+             }
+             xfer_req = node->valid_sz;
+             assert(xfer_req > 0);
++#if 1
++            xfer_sz = 0;
++            xfer_repo_req = (xfer_req / slot_repo_num);
++            for(repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++                file[repo_num] = ctx->file[repo_num];
++                xfer_sz += dfv_file_write(file[repo_num], 
++                           (node->buf_ptr + (repo_num * xfer_repo_req)), xfer_repo_req);
++            }
++#else
+             xfer_sz = dfv_file_write(file, node->buf_ptr, xfer_req);
++#endif
+             if (xfer_sz != xfer_req) {
+                 dfv_bufq_enqueue(&ctx->freeq, node);
+                 ctx->eof = -1;
+@@ -71,6 +98,20 @@
+             dfv_bufq_enqueue(&ctx->freeq, node);
+         }
+     }
++#if 1
++    for(repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++        file[repo_num] = ctx->file[repo_num];
++        spk_stats_t* stats = dfv_file_get_stats(file[repo_num]);
++        if (stats) {
++            zlog_notice(dfv_zc, "    dfvcm#%d> time=%lu pkts=%lu bytes=%lu spd=%.3f MBPS",
++                    ctx->id,
++                    spk_stats_get_time_elapsed(stats)/1000,
++                    spk_stats_get_xfer_pkts(stats),
++                    spk_stats_get_xfer_bytes(stats),
++                    BYTE2MB(spk_stats_get_bps_overall(stats)));
++        }
++    }
++#else
+     if (stats) {
+         zlog_notice(dfv_zc, "    dfvcm#%d> time=%lu pkts=%lu bytes=%lu spd=%.3f MBPS",
+                 ctx->id,
+@@ -79,6 +120,7 @@
+                 spk_stats_get_xfer_bytes(stats),
+                 BYTE2MB(spk_stats_get_bps_overall(stats)));
+     }
++#endif
+     zlog_notice(dfv_zc, "dfvcm#%d> worker terminated", ctx->id);
+ 
+     return(NULL);
+@@ -89,12 +131,22 @@
+     assert(dir == SPK_DIR_READ || dir == SPK_DIR_WRITE);
+ 
+     dfvcm_ctx_t* ctx = NULL;
+-        
++#if 1
++    int repo_num = 0;
++    for (repo_num = 0; repo_num < slot_def->slot_repo_num; repo_num++) {
++        zlog_notice(dfv_zc, "dfvcm#%d> open: repo={%d:%d}, dir=%s, slice={%d, 0x%lx}",
++                             id,
++                             dfv_repo_get_id(slot_def->repo[repo_num]), slot_def->slot_id,
++                             spk_desc_dir2str(dir),
++                             slice_def?slice_def->num:0, slice_def?slice_def->size:0);
++    }
++#else
+     zlog_notice(dfv_zc, "dfvcm#%d> open: repo={%d:%d}, dir=%s, slice={%d, 0x%lx}",
+                          id,
+                          dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
+                          spk_desc_dir2str(dir),
+                          slice_def?slice_def->num:0, slice_def?slice_def->size:0);
++#endif
+ 
+     ctx = malloc(sizeof(dfvcm_ctx_t));
+     assert(ctx);
+@@ -103,7 +155,36 @@
+     ctx->id = id;
+     ctx->dir = dir;
+     ctx->cpu_base = cpu_base;
++#if 1
++    ctx->slot_repo_num = slot_def->slot_repo_num;
++#endif
+     if (dir == SPK_DIR_READ) {
++#if 1
++        for (repo_num = 0; repo_num < slot_def->slot_repo_num; repo_num++) {
++            ctx->slot_sz += dfv_repo_get_slotsize(slot_def->repo[repo_num], slot_def->slot_id);
++            if (ctx->slot_sz <= 0) {
++                goto errout;
++            }
++        }
++    }
++    
++    uint32_t total_cpu_base = cpu_base;
++    int total_cpu_cnt = spk_get_core_num(total_cpu_base);
++    int repo_cpu_cnt = (total_cpu_cnt / (slot_def->slot_repo_num));
++    int reside_cpu_cnt = 0;
++    for (repo_num = 0; repo_num < slot_def->slot_repo_num; repo_num++) {
++        uint32_t repo_cpu_base = spk_alloc_core(&total_cpu_base, repo_cpu_cnt);
++        reside_cpu_cnt = spk_get_core_num(total_cpu_base);
++        if(reside_cpu_cnt < repo_cpu_cnt) {
++            total_cpu_base = cpu_base;
++        }    
++        ctx->file[repo_num] = dfv_file_open(slot_def->repo[repo_num], 
++                              slot_def->slot_id, dir, slice_def, repo_cpu_base);
++        if (!ctx->file[repo_num]) {
++            goto errout;
++        }
++    }
++#else
+         ctx->slot_sz = dfv_repo_get_slotsize(slot_def->repo, slot_def->slot_id);
+         if (ctx->slot_sz <= 0) {
+             goto errout;
+@@ -113,6 +194,7 @@
+     if (!ctx->file) {
+         goto errout;
+     }
++#endif
+ 
+     dfv_bufq_init(&ctx->freeq);
+     dfv_bufq_init(&ctx->workq);
+@@ -123,10 +205,20 @@
+ 
+ errout:
+     if (ctx) {
++#if 1
++        for (repo_num = 0; repo_num < slot_def->slot_repo_num; repo_num++) {
++            if (ctx->file[repo_num]) {
++                dfv_file_close(ctx->file[repo_num]);
++                ctx->file[repo_num] = NULL;
++            }
++        }
++#else
+         if (ctx->file) {
+             dfv_file_close(ctx->file);
+             ctx->file = NULL;
+         }
++#endif
++
+         SAFE_RELEASE(ctx);
+     }
+     return(NULL);
+@@ -145,10 +237,22 @@
+         ctx->quit_req = 1;
+         pthread_join(ctx->cm_thread, NULL);
+     }
++#if 1
++    int repo_num = 0;
++    int slot_repo_num = ctx->slot_repo_num;
++
++    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++        if (ctx->file[repo_num]) {
++            dfv_file_close(ctx->file[repo_num]);
++            ctx->file[repo_num] = NULL;
++        }
++    }
++#else
+     if (ctx->file) {
+         dfv_file_close(ctx->file);
+         ctx->file = NULL;
+     }
++#endif
+     dfv_bufq_node_t* node = NULL;
+     while(!!(node = dfv_bufq_dequeue(&ctx->workq))) {
+         if (free_buf) {
+@@ -187,4 +291,4 @@
+ int dfvcm_get_id(dfvcm_ctx_t* ctx)
+ {
+     return(ctx->id);
+-}
+\ No newline at end of file
++}
+Index: src/libdfv/dfv_file.c
+===================================================================
+--- src/libdfv/dfv_file.c	(revision 80)
++++ src/libdfv/dfv_file.c	(working copy)
+@@ -22,10 +22,12 @@
+     assert(slice_ctx->fd > 0);
+ 
+     if (cpu_base > 0) {
++#if 0
+         cpu_base += slice_id;
++#endif
+         spk_worker_set_affinity(cpu_base);
+     }
+-    zlog_info(dfv_zc, "slice> spawned: id=%d, cpu=%d", slice_id, cpu_base);
++    zlog_notice(dfv_zc, "slice> spawned: id=%d, cpu=%d", slice_id, cpu_base);
+     
+     while (!slice_ctx->quit_req) {
+         pthread_mutex_lock(&slice_ctx->lock);
+@@ -176,9 +178,20 @@
+     file_ctx->slot_id = slot_id;
+     file_ctx->fmeta = fmeta;
+     file_ctx->dir = dir;
+-    
++#if 1
++    uint32_t slice_cpu_base = cpu_base;
++    int core_id = 0;
++#endif
+     // spawn workers
+     for (i=0; i<fmeta->slice_num; i++) {
++#if 1
++        uint32_t  core_base= spk_alloc_core(&slice_cpu_base, 1);
++        int reside_cpu_cnt = spk_get_core_num(slice_cpu_base);
++        if(reside_cpu_cnt <= 0) {
++            slice_cpu_base = cpu_base;
++        }
++        core_id = spk_get_cpubase(core_base);
++#endif
+         dfv_slice_ctx_t* slice_ctx = malloc(sizeof(dfv_slice_ctx_t));
+         assert(slice_ctx);
+         memset(slice_ctx, 0, sizeof(dfv_slice_ctx_t));
+@@ -193,7 +206,11 @@
+ 
+         sprintf(pathname, "%s/%d/"DFV_SLICE_FILENAME, repo->root_path,
+                              slot_id, i+1);
++#if 0
++        fd = open(pathname, O_CREAT | O_RDWR );
++#else
+         fd = open(pathname, O_CREAT | O_RDWR | O_DIRECT);
++#endif
+         if (fd < 0) {
+             zlog_error(dfv_zc, "failed to open file: file=%s, errmsg=%s",
+                         pathname,
+@@ -202,7 +219,7 @@
+         }
+         slice_ctx->fd = fd;
+         file_ctx->slice_tbl[i] = slice_ctx;
+-        slice_ctx->cpu_base = cpu_base;
++        slice_ctx->cpu_base = core_id;
+         pthread_create(slice_ctx->wkr_thread, NULL,
+                          __dfv_slice_worker, slice_ctx);
+     }
+Index: src/libdfv/dfv.h
+===================================================================
+--- src/libdfv/dfv.h	(revision 80)
++++ src/libdfv/dfv.h	(working copy)
+@@ -87,8 +87,9 @@
+     int         quit_req;
+     int         eof;
+ 
+-    dfv_file_t* file;
++    dfv_file_t* file[DFV_PIPE_MAX_REPOS];
+     size_t      slot_sz;
++    int         slot_repo_num;
+ 
+     dfv_bufq_t  workq;
+     dfv_bufq_t  freeq;

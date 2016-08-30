@@ -1,0 +1,145 @@
+1103c1103
+< @@ -97,114 +97,124 @@
+---
+> @@ -97,114 +97,123 @@
+1210d1209
+< +    file_ctx->slice_num = slice_def->num;
+1269c1268
+< +        file_ctx->fmeta[j] = fmeta;
+---
+> +        file_ctx->fmeta = fmeta;
+1316,1337c1315
+< @@ -224,17 +234,17 @@
+<      assert(file_ctx);
+<  
+<      int i;
+< -    dfv_fmeta_t* fmeta = file_ctx->fmeta;
+<      dfv_slice_ctx_t* slice_ctx = NULL;
+< +    int slice_num = file_ctx->slice_num * file_ctx->repo_num;
+<  
+< -    for (i=0; i<fmeta->slice_num; i++) {
+< +    for (i=0; i<slice_num; i++) {
+<          // set quit_req flag
+<          slice_ctx = file_ctx->slice_tbl[i];
+<          slice_ctx->quit_req = 1;
+<          pthread_cond_signal(&slice_ctx->not_empty);
+<      }
+<  
+< -    for (i=0; i<fmeta->slice_num; i++) {
+< +    for (i=0; i<slice_num; i++) {
+<          // wait thread quit
+<          slice_ctx = file_ctx->slice_tbl[i];
+<          pthread_join(*slice_ctx->wkr_thread, NULL);
+< @@ -247,32 +257,36 @@
+---
+> @@ -247,32 +256,35 @@
+1348d1325
+< +        dfv_fmeta_t* fmeta = file_ctx->fmeta[i];
+1350c1327
+< +            if (file_ctx->fmeta[i]->file_pos > 0) {
+---
+> +            if (file_ctx->fmeta->file_pos > 0) {
+1395,1483d1371
+< @@ -282,10 +296,8 @@
+<  
+<  int dfv_file_seek(dfv_file_t* file_ctx, uint64_t offset)
+<  {
+< -    dfv_fmeta_t* fmeta = file_ctx->fmeta;
+< -    assert(fmeta);
+< -    int slice_num = fmeta->slice_num;
+< -    
+< +    int slice_num = (file_ctx->slice_num * file_ctx->repo_num);
+< +    int i=0;    
+<  //    assert(file_ctx->dir == SPK_DIR_READ);
+<  
+<      // offset must 16k*slice_num alignment
+< @@ -298,8 +310,10 @@
+<          pthread_mutex_unlock(&slice_ctx->lock);
+<      }
+<      
+< -    file_ctx->fmeta->file_pos = offset;
+< -    zlog_notice(dfv_zc, "file seek: offset=%lu", offset);
+< +    for(i=0; i<file_ctx->repo_num; i++) {  
+< +        file_ctx->fmeta[i]->file_pos = offset / file_ctx->repo_num;
+< +        zlog_notice(dfv_zc, "file seek: offset=%lu", offset);
+< +    }
+<  
+<      return(SPK_SUCCESS);
+<  }
+< @@ -314,8 +328,8 @@
+<      
+<      zlog_info(dfv_zc, "file read: ctx=%p, buf=%zu@%p", file_ctx, size, buf);
+<  
+< -    dfv_fmeta_t* fmeta = file_ctx->fmeta;
+< -    for (i=0; i<fmeta->slice_num; i++) {
+< +    int slice_num = (file_ctx->slice_num * file_ctx->repo_num);
+< +    for (i=0; i<slice_num; i++) {
+<          slice_ctx = file_ctx->slice_tbl[i];
+<          // wait for slice worker to be idle
+<          pthread_mutex_lock(&slice_ctx->lock);
+< @@ -335,7 +349,7 @@
+<      }
+<  
+<      ret_sz = size;
+< -    for (i=0; i<fmeta->slice_num; i++) {
+< +    for (i=0; i<slice_num; i++) {
+<          slice_ctx = file_ctx->slice_tbl[i];
+<          // wait for slice worker to be idle
+<          pthread_mutex_lock(&slice_ctx->lock);
+< @@ -351,7 +365,9 @@
+<      }
+<      
+<      if (ret_sz > 0) {
+< -        file_ctx->fmeta->file_pos += ret_sz;
+< +        for(i=0; i<file_ctx->repo_num; i++) {  
+< +            file_ctx->fmeta[i]->file_pos += (ret_sz / file_ctx->repo_num);
+< +        }
+<          spk_stats_inc_xfer(&file_ctx->xfer_stats, ret_sz, 1);
+<      }
+<      return(ret_sz);
+< @@ -364,9 +380,9 @@
+<      ssize_t ret_sz = 0;
+<      int i;
+<  
+< -    dfv_fmeta_t* fmeta = file_ctx->fmeta;
+< +    int slice_num = (file_ctx->slice_num * file_ctx->repo_num);
+<  
+< -    for (i=0; i<fmeta->slice_num; i++) {
+< +    for (i=0; i<slice_num; i++) {
+<          slice_ctx = file_ctx->slice_tbl[i];
+<          // wait for slice worker to be idle
+<          pthread_mutex_lock(&slice_ctx->lock);
+< @@ -386,7 +402,7 @@
+<      }
+<  
+<      ret_sz = size;
+< -    for (i=0; i<fmeta->slice_num; i++) {
+< +    for (i=0; i<slice_num; i++) {
+<          slice_ctx = file_ctx->slice_tbl[i];
+<          // wait for slice worker to be idle
+<          pthread_mutex_lock(&slice_ctx->lock);
+< @@ -402,7 +418,9 @@
+<      }
+<      
+<      if (ret_sz > 0) {
+< -        file_ctx->fmeta->file_pos += ret_sz;
+< +        for(i=0; i<file_ctx->repo_num; i++) {  
+< +            file_ctx->fmeta[i]->file_pos += (ret_sz / file_ctx->repo_num);
+< +        }
+<          spk_stats_inc_xfer(&file_ctx->xfer_stats, ret_sz, 1);
+<      }
+<  
+1497c1385
+< @@ -63,10 +63,12 @@
+---
+> @@ -63,8 +63,9 @@
+1505d1392
+< +    int slice_num;
+1507,1508c1394
+< -    dfv_fmeta_t* fmeta;
+< +    dfv_fmeta_t* fmeta[DFV_MAX_REPOS];
+---
+>      dfv_fmeta_t* fmeta;
+1510,1511d1395
+<      spk_stats_t xfer_stats;
+<  } dfv_file_t;

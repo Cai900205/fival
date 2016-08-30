@@ -1,0 +1,171 @@
+diff -uNr tt_src/syslk/syslk.c two_src/syslk/syslk.c
+--- tt_src/syslk/syslk.c	2016-08-15 17:59:58.340939170 +0800
++++ two_src/syslk/syslk.c	2016-08-12 03:42:46.184306995 +0800
+@@ -359,7 +359,7 @@
+     fclose(fp);
+ }
+ #if 1
+-    const char* dfv_name[8] = {"sdb","sdc","sdd","sde","sdf","sdg","sdh","sdi"};
++    const char* dfv_name[SYS_TOTAL_REPO_NUM] = {"sdb","sdc","sdd","sde","sdf","sdg","sdh","sdi"};
+ #endif
+ 
+ int main(int argc, char **argv)
+@@ -420,7 +420,7 @@
+     sys_env.dfv_desc_tbl[0].mnt_path = "dfa";
+     sys_env.dfv_desc_tbl[0].dev_path = "scta";
+     sys_env.dfv_desc_tbl[0].flag = 0;
+-  
++    
+     sys_env.dfv_desc_tbl[1].mnt_path = "dfb";
+     sys_env.dfv_desc_tbl[1].dev_path = "sctb";
+     sys_env.dfv_desc_tbl[1].flag = 0;
+diff -uNr tt_src/syslk/syslk_job.c two_src/syslk/syslk_job.c
+--- tt_src/syslk/syslk_job.c	2016-08-15 18:19:29.137937800 +0800
++++ two_src/syslk/syslk_job.c	2016-08-12 03:55:17.471306148 +0800
+@@ -228,15 +228,14 @@
+     spk_stats_t* stats = &wkr_ctx->stats;
+ 
+     void* chunk_buf = NULL;
+-    size_t chunk_size = (slice_def->size * slice_def->num * slot_def->slot_repo_num);
+-    uint32_t dfv_cpu_base = 0x00007800;//12+4*wkr_ctx->wkr_id;
++    size_t chunk_size = (slice_def->size * slice_def->num * SYS_PIPE_REPO_NUM);
++    uint32_t dfv_cpu_base = 0x000f000;//12+4*wkr_ctx->wkr_id;
+     if (wkr_ctx->wkr_id) {
+-        dfv_cpu_base = 0x00078000;
++        dfv_cpu_base = 0x000f0000;
+     }
+ #if 1
+     int repo_num = 0;
+-    int slot_repo_num = slot_def->slot_repo_num;
+-    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++    for (repo_num = 0; repo_num < slot_def->slot_repo_num; repo_num++) {
+         zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
+                         "slice={%d, 0x%lx}, cpu_base=%d}",
+                         wkr_id,
+@@ -260,10 +259,10 @@
+ #if 1
+     uint32_t total_cpu_base = dfv_cpu_base;
+     int total_cpu_cnt = spk_get_core_num(total_cpu_base);
+-    int repo_cpu_cnt = (total_cpu_cnt / slot_repo_num);
++    int repo_cpu_cnt = (total_cpu_cnt / SYS_PIPE_REPO_NUM);
+     int reside_cpu_cnt = 0;
+    
+-    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++    for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
+         uint32_t repo_cpu_base = spk_alloc_core(&total_cpu_base, repo_cpu_cnt);
+         reside_cpu_cnt = spk_get_core_num(total_cpu_base);
+         if(reside_cpu_cnt < repo_cpu_cnt) {
+@@ -290,7 +289,6 @@
+ 
+ #endif
+     // write to dfv
+-#if 0
+     if (!(sys_env.dbg_flag & SYSDBG_REC_NOTSAVE2DISK)) {
+         size_t warmup_sz = 128*1024*1024;
+         size_t xferred = 0;
+@@ -301,7 +299,7 @@
+         memset(txbuf, 0xfe, DFV_CHUNK_SIZE);
+         while(xferred < warmup_sz) {
+ #if 1
+-            for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++            for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
+                 ssize_t xfer = dfv_file_write(file_ctx[repo_num], 
+                             (txbuf + (REPO_DFV_CHUNK_SIZE*repo_num)), REPO_DFV_CHUNK_SIZE);
+                 if (xfer != REPO_DFV_CHUNK_SIZE) {
+@@ -315,7 +313,7 @@
+             }
+         }
+ 
+-        for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++        for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
+             dfv_file_seek(file_ctx[repo_num], 0);
+         }
+ #else
+@@ -334,7 +332,7 @@
+         SAFE_RELEASE(txbuf);
+     }
+     zlog_notice(sys_zc, "wkr#%d> dfv warmup done", wkr_id);
+-#endif
++
+ 
+     // open ips srio
+     pcctx = ips_chan_open(src_id, pc_id);
+@@ -378,8 +376,8 @@
+             } else {
+ #if 1
+                 xfer = 0;
+-                ssize_t repo_size = (read_size / slot_repo_num);
+-                for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++                ssize_t repo_size = (read_size / SYS_PIPE_REPO_NUM);
++                for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
+                     xfer += dfv_file_write(file_ctx[repo_num], 
+                         (chunk_buf + (repo_size * repo_num)), repo_size);
+                 }
+@@ -471,10 +469,9 @@
+                 xfer = tail_size;
+             } else {
+ #if 1
+-                xfer = 0;
+-                ssize_t repo_size = (tail_size / slot_repo_num);
+-                for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
+-                    xfer += dfv_file_write(file_ctx[repo_num], 
++                ssize_t repo_size = (tail_size / SYS_PIPE_REPO_NUM);
++                for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
++                    xfer = dfv_file_write(file_ctx[repo_num], 
+                         (chunk_buf + (repo_size * repo_num)), repo_size);
+                 }
+ #else
+@@ -504,7 +501,7 @@
+                             stats->xfer.pkts, stats->xfer.bytes, stats->overflow.bytes);
+     }
+ #if 1
+-    for (repo_num = 0; repo_num < slot_repo_num; repo_num++) {
++    for (repo_num = 0; repo_num < SYS_PIPE_REPO_NUM; repo_num++) {
+         if (file_ctx[repo_num]) {
+             dfv_file_close(file_ctx[repo_num]);
+             file_ctx[repo_num] = NULL;
+@@ -578,11 +575,11 @@
+     void * txbuf = NULL;
+     size_t txbuf_sz = 0;
+     int i;
+-    uint32_t dfv_cpu_base = 0x00007800;//12+4*wkr_ctx->wkr_id;
++    uint32_t dfv_cpu_base = 0x000f000;//12+4*wkr_ctx->wkr_id;
++    //int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
+     if (wkr_ctx->wkr_id) {
+-        dfv_cpu_base = 0x00078000;
++        dfv_cpu_base = 0x000f0000;
+     }
+-    //int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
+ 
+ #if 1
+     int repo_num = 0;
+@@ -667,7 +664,7 @@
+         }
+         dfv_bufq_node_t* node = dfv_bufq_dequeue(dfvcm_get_workq(dfvcm));
+         if (syslk_ips_mode.dma_use_chain) {
+-            if(current_buf_num <= (DFVCM_BUF_NODE_NUM/2)) {
++            if(current_buf_num <= 4) {
+                 int free_buf_num = ips_chan_get_tx_freebn(pcctx, DFV_CHUNK_SIZE);
+                 if(free_buf_num > 0) {
+                     for(i=0; i<free_buf_num; i++) {
+Binary files tt_src/testapp/ips_tb/dual_slave and two_src/testapp/ips_tb/dual_slave differ
+diff -uNr tt_src/testapp/ips_tb/dual_slave.c two_src/testapp/ips_tb/dual_slave.c
+--- tt_src/testapp/ips_tb/dual_slave.c	2016-08-15 18:50:41.172935527 +0800
++++ two_src/testapp/ips_tb/dual_slave.c	2016-08-12 03:43:29.320307234 +0800
+@@ -161,11 +161,13 @@
+         
+         now = spk_get_tick_count();
+         if (read_size == 0) {
++      /*
+             if (now - timeout_tick > 2*1000) {
+                 // timeout
+                 printf("RX#%d: timeout\n", wkr_id);
+                 break;
+             }
++        */
+             continue;
+         }
+         ips_chan_free_buf(pcctx, read_size);
+Binary files tt_src/testapp/ips_tb/dual_slave.o and two_src/testapp/ips_tb/dual_slave.o differ
+Binary files tt_src/testapp/ips_tb/loopback and two_src/testapp/ips_tb/loopback differ
+Binary files tt_src/testapp/ips_tb/loopback.o and two_src/testapp/ips_tb/loopback.o differ
