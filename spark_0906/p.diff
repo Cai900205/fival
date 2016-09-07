@@ -1,0 +1,303 @@
+Binary files p_src/libcmi/cmi_core.o and test_src/libcmi/cmi_core.o differ
+Binary files p_src/libcmi/cmi_msg.o and test_src/libcmi/cmi_msg.o differ
+Binary files p_src/libcmi/cmi_sock.o and test_src/libcmi/cmi_sock.o differ
+Binary files p_src/libcmi/libcmi.a and test_src/libcmi/libcmi.a differ
+Binary files p_src/libdfv/dfv_cm.o and test_src/libdfv/dfv_cm.o differ
+Binary files p_src/libdfv/dfv_file.o and test_src/libdfv/dfv_file.o differ
+Binary files p_src/libdfv/dfv_meta.o and test_src/libdfv/dfv_meta.o differ
+Binary files p_src/libdfv/dfv.o and test_src/libdfv/dfv.o differ
+Binary files p_src/libdfv/dfv_repo.o and test_src/libdfv/dfv_repo.o differ
+Binary files p_src/libdfv/libdfv.a and test_src/libdfv/libdfv.a differ
+Binary files p_src/libidt/idt_core.o and test_src/libidt/idt_core.o differ
+Binary files p_src/libidt/libidt.a and test_src/libidt/libidt.a differ
+Binary files p_src/libips/ips_cmd.o and test_src/libips/ips_cmd.o differ
+Binary files p_src/libips/ips_core.o and test_src/libips/ips_core.o differ
+Binary files p_src/libips/libips.a and test_src/libips/libips.a differ
+Binary files p_src/sysagt/sysagt and test_src/sysagt/sysagt differ
+Binary files p_src/sysagt/sysagt.o and test_src/sysagt/sysagt.o differ
+Binary files p_src/syslk/syslk and test_src/syslk/syslk differ
+Binary files p_src/syslk/syslk_cmd.o and test_src/syslk/syslk_cmd.o differ
+diff -uNr p_src/syslk/syslk.h test_src/syslk/syslk.h
+--- p_src/syslk/syslk.h	2016-09-07 03:18:46.881647995 +0800
++++ test_src/syslk/syslk.h	2016-09-07 01:10:46.344657093 +0800
+@@ -8,7 +8,7 @@
+ 
+ #define SYS_VERSION_MAJOR   0
+ #define SYS_VERSION_MINOR   9
+-#define SYS_VERSION_DATE    160906
++#define SYS_VERSION_DATE    160826
+ 
+ #define SYS_VERSION         MAKE_VER_STR(SYS_VERSION_MAJOR, SYS_VERSION_MINOR, SYS_VERSION_DATE)
+ #define SYS_VERSION_INT     MAKE_VER_INT(SYS_VERSION_MAJOR, SYS_VERSION_MINOR, SYS_VERSION_DATE)
+diff -uNr p_src/syslk/syslk_job.c test_src/syslk/syslk_job.c
+--- p_src/syslk/syslk_job.c	2016-09-07 03:18:46.881647995 +0800
++++ test_src/syslk/syslk_job.c	2016-09-07 01:10:46.345657093 +0800
+@@ -116,7 +116,7 @@
+     struct dfv_file* file_ctx = NULL;
+     void* file_buffer = memalign(SYS_INTERLACE_SIZE, cache_sz_repo);
+     for (i=0; i<pipe_num; i++) {
+-        int repo_offset = i * pipe_repo_num;
++        int repo_offset = i* pipe_repo_num;
+         dfv_slot_def_t slot_def;
+         for(j=0; j<pipe_repo_num; j++) {
+             slot_def.repo[j] = ctx->vault->repo_tbl[j+repo_offset];
+@@ -133,6 +133,7 @@
+         if (ret) {
+             goto out;
+         }
++
+         ssize_t read_sz = dfv_file_read(file_ctx, file_buffer, cache_sz_repo);
+         if (read_sz != cache_sz_repo) {
+             ret = SPKERR_BADRES;
+@@ -238,6 +239,7 @@
+     size_t chunk_size = (slice_def->size * slice_def->num *repo_num);
+     int dfv_cpu_base = 8+slice_def->num*wkr_ctx->wkr_id;
+ 
++#if 1
+     int repo_id = 0;
+     for (repo_id=0; repo_id<repo_num; repo_id++) {
+         zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
+@@ -248,6 +250,15 @@
+                         slice_def->num, slice_def->size,
+                         dfv_cpu_base);
+     }
++#else
++    zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
++                        "slice={%d, 0x%lx}, cpu_base=%d}",
++                        wkr_id,
++                        src_id, pc_id,
++                        dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
++                        slice_def->num, slice_def->size,
++                        dfv_cpu_base);
++#endif
+ 
+     // reset stats
+     spk_stats_reset(stats);
+@@ -286,7 +297,7 @@
+     }
+     zlog_notice(sys_zc, "wkr#%d> dfv warmup done", wkr_id);
+ 
+-
++#if 0
+     // open ips srio
+     pcctx = ips_chan_open(src_id, pc_id);
+     if (!pcctx) {
+@@ -301,7 +312,9 @@
+         goto out;
+     }
+     zlog_info(sys_zc, "wkr#%d> ips channel started for reading", wkr_id);
+-
++#else
++    chunk_buf = memalign(4*1024, chunk_size);
++#endif
+     // start recording
+     uint64_t now = spk_get_tick_count();
+     uint64_t tm_upstats = now;
+@@ -314,7 +327,11 @@
+         // read from ips for one chunk
+         // FIXME: our link partner must have enough data
+         // before being stopped
++#if 0
+         ssize_t read_size = ips_chan_read(pcctx, &chunk_buf, chunk_size, chunk_size);
++#else
++        ssize_t read_size = chunk_size;
++#endif
+         if (read_size > 0) {
+             // got a chunk from ips
+             assert(read_size == chunk_size);
+@@ -329,10 +346,10 @@
+             } else {
+                 xfer = dfv_file_write(file_ctx, chunk_buf, read_size);
+             }
+-
++#if 0
+             // notify ips to free buffer first
+             ips_chan_free_buf(pcctx, read_size);
+-
++#endif
+             if (xfer != read_size) {
+                 zlog_fatal(sys_zc, "wkr#%d> failed to write to dfv: xfer=%ld, expect=%lu",
+                                     wkr_id, xfer, read_size);
+@@ -384,6 +401,7 @@
+     // stop recording
+     //
+     // 1. send stop to link partner
++#if 0
+     int stop_ret = ips_chan_stop(pcctx);
+     if (stop_ret != SPK_SUCCESS) {
+         zlog_fatal(sys_zc, "wkr#%d> failed to close ips channel: ret=%d",
+@@ -391,7 +409,6 @@
+         ret = stop_ret;
+         goto out;
+     }
+-
+     // 2. drain remained data
+     if (ret == SPK_SUCCESS) {
+         // wait for link partner to do padding
+@@ -428,6 +445,7 @@
+     if (!(sys_env.features & SYSFEA_USE_LOCALSTATS)) {
+         sys_job_update_stats(pcctx, wkr_id);
+     }
++#endif
+ 
+ out:
+     zlog_notice(sys_zc, "wkr#%d> ---------- stop recording ---------- ret=%d,", wkr_id, ret);
+@@ -442,13 +460,14 @@
+         dfv_file_close(file_ctx);
+         file_ctx = NULL;
+     }
+-
++#if 0
+     // close ips srio
+     if (pcctx) {
+         ips_chan_close(pcctx);
+         pcctx = NULL;
+     }
+ #endif
++#endif
+     return(ret);
+ }
+ 
+@@ -510,8 +529,8 @@
+     int repo_num = slot_def->repo_num;
+     chunk_size = (repo_num*slice_num*DFV_SLICE_SIZE);
+     int dfv_cpu_base = 8+slice_num*wkr_ctx->wkr_id;
++#if 1
+     int repo_id = 0;
+-    
+     for (repo_id = 0; repo_id < slot_def->repo_num; repo_id++) {
+         zlog_notice(sys_zc, "wkr#%d> prepare for playback: ips={0x%x:%d}, "
+                         "dfv={repo={%d:%d}, sz=%lu, cpu_base=%d}",
+@@ -520,10 +539,19 @@
+                         dfv_repo_get_id(slot_def->repo[repo_id]), slot_def->slot_id,
+                         slot_sz, dfv_cpu_base);
+     }
++#else
++    zlog_notice(sys_zc, "wkr#%d> prepare for playback: ips={0x%x:%d}, "
++                        "dfv={repo={%d:%d}, sz=%lu, cpu_base=%d}",
++                        wkr_id,
++                        src_id, pc_id,
++                        dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
++                        slot_sz, dfv_cpu_base);
++#endif
+ 
+     // reset stats
+     spk_stats_reset(stats);
+ 
++#if 0
+     // open ips srio
+     pcctx = ips_chan_open(src_id, pc_id);
+     if (!pcctx) {
+@@ -538,6 +566,7 @@
+         goto out;
+     }
+     zlog_info(sys_zc, "wkr#%d> ips channel started for writing", wkr_id);
++#endif
+ 
+     // clean stats
+     if (!(sys_env.features & SYSFEA_USE_LOCALSTATS)) {
+@@ -547,7 +576,12 @@
+     int dfvcm_buf_nodes = ((DFVCM_BUF_NODE_NUM)/(slice_num*repo_num));//
+     // we use ips's tx_buffers directly (for zero-copy)
+     // scratch bufs from ips
++#if 0
+     txbuf = ips_chan_get_txbuf(pcctx, &txbuf_sz);
++#else
++    txbuf_sz = 128*1024*1024;
++    txbuf = memalign(4*1024, txbuf_sz);
++#endif
+     // WARNING: IPS must allocated enough tx_buffer, so check it
+     assert(txbuf && txbuf_sz >= dfvcm_buf_nodes*chunk_size);
+ 
+@@ -587,7 +621,11 @@
+         dfv_bufq_node_t* node = dfv_bufq_dequeue(dfvcm_get_workq(dfvcm));
+         if (syslk_ips_mode.dma_use_chain) {
+             if(current_buf_num <= (dfvcm_buf_nodes/2)) {
++#if 0
+                 int free_buf_num = ips_chan_get_tx_freebn(pcctx, chunk_size);
++#else
++                int free_buf_num = 1;
++#endif
+                 if(free_buf_num > 0) {
+                     for(i=0; i<free_buf_num; i++) {
+                         int index = (use_buf_num % dfvcm_buf_nodes);
+@@ -609,7 +647,11 @@
+         // write to ips
+         uint64_t tmout = spk_get_tick_count() + 5*1000; // timeout 5secs
+         while(!wkr_ctx->reset_req) {
++#if 0
+             ssize_t xfer = ips_chan_write(pcctx, node->buf_ptr, node->valid_sz);
++#else
++            ssize_t xfer = node->valid_sz;
++#endif
+             if (xfer == node->valid_sz) {
+                 // done
+                 if (!syslk_ips_mode.dma_use_chain) {
+@@ -672,11 +714,13 @@
+     }
+ 
+     // close ips srio
++#if 0
+     if (pcctx) {
+         ips_chan_close(pcctx);
+         pcctx = NULL;
+     }
+ #endif
++#endif
+     return(ret);
+ }
+ 
+Binary files p_src/syslk/syslk_job.o and test_src/syslk/syslk_job.o differ
+Binary files p_src/syslk/syslk.o and test_src/syslk/syslk.o differ
+diff -uNr p_src/testapp/dfv_tb/main.c test_src/testapp/dfv_tb/main.c
+--- p_src/testapp/dfv_tb/main.c	2016-09-07 03:18:46.757647995 +0800
++++ test_src/testapp/dfv_tb/main.c	2016-09-07 01:10:46.333657093 +0800
+@@ -109,8 +109,9 @@
+             repo_mnt_num++;
+         }
+     }
+-
++//ctx add
+     size_t chunk_size = DFV_SLICE_NUM*DFV_SLICE_SIZE*repo_mnt_num;
++    
+     file_buffer = memalign(4*1024, chunk_size);
+     assert(file_buffer);
+ 
+diff -uNr p_src/testapp/idt_tb/idt_port.c test_src/testapp/idt_tb/idt_port.c
+--- p_src/testapp/idt_tb/idt_port.c	2016-09-07 03:18:46.825647996 +0800
++++ test_src/testapp/idt_tb/idt_port.c	2016-09-07 01:10:46.333657093 +0800
+@@ -35,24 +35,14 @@
+ {
+     int ret = -1;
+     int i;
+-    int found = 0;
+     for (i=0; i<sizeof(linkspd_tbl)/sizeof(linkspd_tbl[0]); i++) {
+         if (rate == linkspd_tbl[i].rate &&
+             pll_div_sel == linkspd_tbl[i].pll_div_sel) {
+             ret = i;
+-            found = 1;
+             break;
+         }
+     }
+ 
+-    if (!found) {
+-        if ((pll_div_sel == 0) && (rate == 3)) {
+-            ret = 3;
+-        } else if((pll_div_sel == 1) && (rate == 3)) {
+-            ret = 4;
+-        } 
+-    }
+-
+     return(ret);
+ }
+ 
+@@ -240,6 +230,9 @@
+         if (!PORT_EXISTS(pbmp, pid))
+             continue;
+ 
++        if (pid == IDT_PORT_SRIO0 || pid == IDT_PORT_SRIO1)
++            continue;
++
+         printf("  recovery <%s>\n", port_def_tbl[pid].port_name);
+         if (pid == IDT_PORT_SRIO0) {
+             // reset host's ackID

@@ -1,0 +1,1646 @@
+Index: include/dfv/dfv_intf.h
+===================================================================
+--- include/dfv/dfv_intf.h	(revision 80)
++++ include/dfv/dfv_intf.h	(working copy)
+@@ -2,9 +2,9 @@
+ #define __DFV_INTF_H__
+ #include <inttypes.h>
+ 
+-#define DFV_MOD_VER     "0.9.151230"
++#define DFV_MOD_VER     "0.9.160906"
+ 
+-#define DFV_MAX_REPOS   (4) // max repos in vault
++#define DFV_MAX_REPOS   (16) // max repos in vault
+ #define DFV_MAX_SLOTS   (999)
+ 
+ typedef struct
+@@ -28,8 +28,9 @@
+ 
+ typedef struct
+ {
+-    struct dfv_repo* repo;
++    struct dfv_repo* repo[DFV_MAX_REPOS];
+     int slot_id;
++    int repo_num;
+ } dfv_slot_def_t;
+ 
+ int dfv_module_init(const char* log_cat);
+@@ -48,7 +49,7 @@
+ int dfv_repo_sync(struct dfv_repo* repo);
+ 
+ // file
+-struct dfv_file* dfv_file_open(struct dfv_repo* repo, int slot_id, SPK_DIR dir, dfv_slice_def_t* slice_def, int cpu_base);
++struct dfv_file* dfv_file_open(dfv_slot_def_t* slot_def, SPK_DIR dir, dfv_slice_def_t* slice_def, int cpu_base);
+ int dfv_file_close(struct dfv_file* file_ctx);
+ int dfv_file_seek(struct dfv_file* file, uint64_t offset);
+ ssize_t dfv_file_read(struct dfv_file* file_ctx, void* buf, size_t size);
+@@ -60,6 +61,7 @@
+ {
+     int slot_id;
+     int slice_num;
++    int total_slice_num;
+     size_t slice_sz;
+     size_t slot_sz;
+     uint64_t file_time;
+Index: include/idt/idt_intf.h
+===================================================================
+--- include/idt/idt_intf.h	(revision 80)
++++ include/idt/idt_intf.h	(working copy)
+@@ -22,6 +22,8 @@
+ #define IDTR_DEV_INF_CAR                    (0x000004)
+ 
+ #define IDTR_RTE_DEFAULT_PORT_CSR           (0x000078)
++#define IDTR_RTE_DESTID_CSR                 (0x000070)
++#define IDTR_RTE_PORT_CSR                   (0x000074)
+ 
+ #define IDTR_PORT_LINK_TO_CTL_CSR           (0x000120)
+ 
+Index: src/testapp/ips_tb/dual_slave.c
+===================================================================
+--- src/testapp/ips_tb/dual_slave.c	(revision 80)
++++ src/testapp/ips_tb/dual_slave.c	(working copy)
+@@ -37,6 +37,7 @@
+ 
+ };
+ int break_req = 0;
++int sys_pipe_num = 2;
+ pthread_barrier_t barrier;
+ 
+ typedef struct thread_args {
+@@ -112,20 +113,22 @@
+         hb_tick = now + 2000;
+ 
+         sync_cnt_local++;
+-        while ((sync_cnt % 2) != wkr_id && !break_req) {
+-            usleep(10);
++        if (sys_pipe_num == 2) {
++            while (((sync_cnt % 2) != wkr_id) && (!break_req)) {
++                usleep(10);
++            }
+         }
+         sync_cnt++;
+ 
+         assert(write_ret == tx_sz);
+         if (now > refresh_tick) {
+-            printf("TX#%d: time:%lu pkts:%lu bytes:%lu ovl:%.3f wire:%.3f \n",
++            printf("TX#%d: time:%lu pkts:%lu bytes:%lu ovl:%.3f wire:%.3f sync_cnt:%lx\n",
+                 wkr_id,
+                 spk_stats_get_time_elapsed(stats)/1000,
+                 spk_stats_get_xfer_pkts(stats),
+                 spk_stats_get_xfer_bytes(stats),
+                 BYTE2MB(spk_stats_get_bps_overall(stats)),
+-                BYTE2MB(spk_stats_get_bps_wire(stats)));
++                BYTE2MB(spk_stats_get_bps_wire(stats)), sync_cnt);
+             refresh_tick = now + 1000;
+         }
+     }
+@@ -242,9 +245,9 @@
+     dictionary *ini = NULL;
+     int ret = 0;
+    
+-    ini = iniparser_load("./conf.ini");
++    ini = iniparser_load("./slave.ini");
+     if (ini == NULL) {
+-        fprintf(stderr,"can not open %s","conf.ini");
++        fprintf(stderr,"can not open %s","slave.ini");
+         return;
+     }
+     ret = iniparser_getint(ini, "ips_mode:dma_use_chain", -1);
+@@ -255,22 +258,26 @@
+     if(ret != -1) {
+         test_ips_mode.dma_use_nlwr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:tx_wptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:tx_use_wptr", -1);
+     if(ret != -1) {
+         test_ips_mode.tx.use_wptr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:tx_rptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:tx_use_rptr", -1);
+     if(ret != -1) {
+         test_ips_mode.tx.use_rptr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:rx_wptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:rx_use_wptr", -1);
+     if(ret != -1) {
+         test_ips_mode.rx.use_wptr = ret;
+     }
+-    ret = iniparser_getint(ini, "ips_mode:rx_rptr_mode", -1);
++    ret = iniparser_getint(ini, "ips_mode:rx_use_rptr", -1);
+     if(ret != -1) {
+         test_ips_mode.rx.use_rptr = ret;
+     }
++    ret = iniparser_getint(ini, "slave_mode:sys_pipe_num", -1);
++    if(ret != -1) {
++        sys_pipe_num = ret;
++    }
+ }
+ 
+ int main(int argc, char **argv)
+@@ -284,26 +291,33 @@
+     rvl = idt_module_init(NULL);
+     assert(!rvl);
+     
++    //init ips mode
++    parse_ips_mode_ini();
++    printf("ips mode  dma_use_nlwr:%d dma_use_chain:%d tx_use_wptr:%d tx_use_rptr:%d rx_use_wptr:%d rx_use_rptr:%d\n",
++          test_ips_mode.dma_use_nlwr, test_ips_mode.dma_use_chain, test_ips_mode.tx.use_wptr,
++          test_ips_mode.tx.use_rptr, test_ips_mode.rx.use_wptr, test_ips_mode.rx.use_rptr);
++    printf("slave mode pipe_num:%d\n", sys_pipe_num);
++
+     // channel 0
+     link_desc_tbl[0].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 0x0);
+     link_desc_tbl[0].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 0x0);
+     link_desc_tbl[0].mst_port = 6;
+     link_desc_tbl[0].slv_port = 1;
+     link_desc_tbl[0].is_master = 0;
+-    
+-    link_desc_tbl[1].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 0x1);
+-    link_desc_tbl[1].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 0x1);
+-    link_desc_tbl[1].mst_port = 3;
+-    link_desc_tbl[1].slv_port = 4;
+-    link_desc_tbl[0].is_master = 0;
+-    
+-    pthread_barrier_init(&barrier, NULL, PIPE_NUM);
++    if (sys_pipe_num == 2) {
++        link_desc_tbl[1].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 0x1);
++        link_desc_tbl[1].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 0x1);
++        link_desc_tbl[1].mst_port = 3;
++        link_desc_tbl[1].slv_port = 4;
++        link_desc_tbl[0].is_master = 0;
++    }
++    pthread_barrier_init(&barrier, NULL, sys_pipe_num);
+     sync_cnt = 0;
+     pthread_mutex_init(&sync_cnt_lock, NULL);
+ 
+     int idt_fd = idt_dev_open(2, 0x67);
+     assert(idt_fd > 0);    
+-    for(i=0; i<PIPE_NUM; i++){
++    for(i=0; i<sys_pipe_num; i++){
+         ips_linkdesc_t* desc = &link_desc_tbl[i];
+         
+         if (desc->is_master) {
+@@ -321,10 +335,8 @@
+         }
+     }
+     idt_dev_close(idt_fd);
+-    //init ips mode
+-    parse_ips_mode_ini();
+     ips_init_mode(test_ips_mode);
+-    for(int pipe=0; pipe<PIPE_NUM; pipe++) {
++    for(int pipe=0; pipe<sys_pipe_num; pipe++) {
+         ips_epdesc_t   epdesc;
+         memset(&epdesc, 0, sizeof(ips_epdesc_t));
+         epdesc.capacity = 0;
+@@ -347,7 +359,7 @@
+     }
+ 
+     while(1) {
+-        for(int pipe=0; pipe<PIPE_NUM; pipe++) {
++        for(int pipe=0; pipe<sys_pipe_num; pipe++) {
+             pthread_join(wkr[pipe], NULL);
+         }
+     };
+Index: src/testapp/dfv_tb/main.c
+===================================================================
+--- src/testapp/dfv_tb/main.c	(revision 80)
++++ src/testapp/dfv_tb/main.c	(working copy)
+@@ -11,22 +11,25 @@
+ #include "fica_opt.h"
+ #include "dfv/dfv_intf.h"
+ 
+-#define DFV_SLICE_NUM   (4)
++#define DFV_SLICE_NUM   (2)
+ #define DFV_SLICE_SIZE  (4*1024*1024)
+-#define DFV_CHUNK_SIZE  (DFV_SLICE_NUM*DFV_SLICE_SIZE)
+ #define DEFAULT_FILE_SIZE    (32*1024*1024)
+ 
+ char* repo_mnt_default[] =
+ {
+-    "dfa",
+-    "dfb",
++    "sdb",
++    "sdc",
++    "sdd",
++    "sde",
+     NULL
+ };
+ 
+ char* repo_dev_default[] =
+ {
+-    "scta",
+-    "sctb",
++    "sdb",
++    "sdc",
++    "sdd",
++    "sde",
+     NULL
+ };
+ 
+@@ -69,7 +72,7 @@
+     // parse args
+     int parse_argc = 0;
+     int repo_mnt_num = 0;
+-    int repo_dev_num = 0;    
++    int repo_dev_num = 0;   
+     while (parse_argc+2 < argc) {
+         char* parse_pos = argv[parse_argc+2];
+         do {
+@@ -82,9 +85,9 @@
+                 } else if (!strcasecmp(key, "--repo-dev")) {
+                     assert(repo_dev_num >= DFV_MAX_REPOS);
+                     repo_dev_tbl[repo_dev_num++] = value;
+-                } else if (!strcasecmp(key, "--file-sizek")) {
++                } else if (!strcasecmp(key, "--file-sizeG")) {
+                     size_t file_sz_in_kb = strtoul(value, NULL, 0);
+-                    file_size = file_sz_in_kb * 1024;
++                    file_size = file_sz_in_kb * 1024 *1024 *1024;
+                 } else {
+                     printf("Unknown option: key=%s\n", key);
+                     exit(1);
+@@ -107,12 +110,13 @@
+         }
+     }
+ 
+-    file_buffer = memalign(4*1024, DFV_CHUNK_SIZE);
++    size_t chunk_size = DFV_SLICE_NUM*DFV_SLICE_SIZE*repo_mnt_num;
++    file_buffer = memalign(4*1024, chunk_size);
+     assert(file_buffer);
+ 
+-    vault = dfv_vault_create(repo_mnt_num, repo_mnt_tbl, repo_dev_tbl, 0);
++    vault = dfv_vault_open(repo_mnt_num, repo_mnt_tbl, repo_dev_tbl, 0);
+     if (!vault) {
+-        printf("Failed to create vault\n");
++        printf("Failed to create vault, mnt_num:%d\n", repo_mnt_num);
+         exit(1);
+     }
+ 
+@@ -167,39 +171,39 @@
+         if (slot_id < 0) {
+             slot_id = dfv_vault_get_freeslot(vault);
+         }
++        dfv_slot_def_t slot_def;
+         for (i=0; i<vault->repo_num; i++) {
+-            size_t repo_file_size = file_size / vault->repo_num;
+-
+-            struct dfv_file* file_ctx = NULL;
+-            dfv_slice_def_t slice_def;
+-            slice_def.num = DFV_SLICE_NUM;
+-            slice_def.size = DFV_SLICE_SIZE;
+-            file_ctx = dfv_file_open(vault->repo_tbl[i], slot_id, SPK_DIR_WRITE, &slice_def, 0);
+-            assert(file_ctx);
+-    
+-            size_t xferred = 0;
+-            uint64_t data = 0;
+-            while(xferred < repo_file_size) {
+-                size_t xfer = MIN(DFV_CHUNK_SIZE, repo_file_size-xferred);
+-                for (int i=0; i<xfer/8; i++) {
+-                    *((uint64_t*)file_buffer+i) = data++;
+-                }
+-                ssize_t written = dfv_file_write(file_ctx, file_buffer, xfer);
+-                if (written < 0) {
+-                    printf("written = %ld\n", written);
+-                    goto out;
+-                }
+-                xferred += xfer;
++            slot_def.repo[i] = vault->repo_tbl[i];
++        }
++        slot_def.slot_id = slot_id;
++        slot_def.repo_num = vault->repo_num;
++        struct dfv_file* file_ctx = NULL;
++        dfv_slice_def_t slice_def;
++        slice_def.num = DFV_SLICE_NUM;
++        slice_def.size = DFV_SLICE_SIZE;
++        file_ctx = dfv_file_open(&slot_def, SPK_DIR_WRITE, &slice_def, 4);
++        assert(file_ctx);
++        size_t xferred = 0;
++        uint64_t data = 0;
++        for (int i=0; i<chunk_size/8; i++) {
++            *((uint64_t*)file_buffer+i) = data++;
++        }
++        while(xferred < file_size) {
++            size_t xfer = MIN(chunk_size, file_size-xferred);
++            ssize_t written = dfv_file_write(file_ctx, file_buffer, xfer);
++            if (written < 0) {
++                printf("written = %ld\n", written);
++                goto out;
+             }
+-    
+-            ret = dfv_file_close(file_ctx);
+-            assert(!ret);
++            xferred += xfer;
+         }
++        ret = dfv_file_close(file_ctx);
++        assert(!ret);
+         printf("== file created: slot=%d, ret=%d\n", slot_id, ret);
+     } else {
+     }
+ out:
+-    dfv_vault_fini(vault);
++    dfv_vault_close(vault);
+     SAFE_RELEASE(file_buffer);
+ 
+     zlog_fini();
+Index: src/testapp/idt_tb/idt_port.c
+===================================================================
+--- src/testapp/idt_tb/idt_port.c	(revision 80)
++++ src/testapp/idt_tb/idt_port.c	(working copy)
+@@ -35,14 +35,24 @@
+ {
+     int ret = -1;
+     int i;
++    int found = 0;
+     for (i=0; i<sizeof(linkspd_tbl)/sizeof(linkspd_tbl[0]); i++) {
+         if (rate == linkspd_tbl[i].rate &&
+             pll_div_sel == linkspd_tbl[i].pll_div_sel) {
+             ret = i;
++            found = 1;
+             break;
+         }
+     }
+ 
++    if (!found) {
++        if ((pll_div_sel == 0) && (rate == 3)) {
++            ret = 3;
++        } else if((pll_div_sel == 1) && (rate == 3)) {
++            ret = 4;
++        } 
++    }
++
+     return(ret);
+ }
+ 
+@@ -230,9 +240,6 @@
+         if (!PORT_EXISTS(pbmp, pid))
+             continue;
+ 
+-        if (pid == IDT_PORT_SRIO0 || pid == IDT_PORT_SRIO1)
+-            continue;
+-
+         printf("  recovery <%s>\n", port_def_tbl[pid].port_name);
+         if (pid == IDT_PORT_SRIO0) {
+             // reset host's ackID
+Index: src/syslk/syslk_job.c
+===================================================================
+--- src/syslk/syslk_job.c	(revision 80)
++++ src/syslk/syslk_job.c	(working copy)
+@@ -38,7 +38,11 @@
+     int ret;
+     sys_ctx_t* ctx = &sys_ctx;
+     int repo_num = ctx->vault->repo_num;
+-    size_t cache_sz = SYS_CACHE_SIZE;
++    int slice_num = syslk_mode.repo_slice_num;
++    size_t sys_cache_sz = (repo_num * slice_num * DFV_SLICE_SIZE);
++    size_t cache_sz = sys_cache_sz;
++    int pipe_num = syslk_mode.sys_pipe_num;
++    int pipe_repo_num = repo_num / pipe_num;
+     int i, j;
+     int interlace_sz = SYS_INTERLACE_SIZE;
+ 
+@@ -59,8 +63,8 @@
+     }
+ 
+     // request region
+-    uint64_t req_start = blk_start * SYS_CACHE_SIZE;
+-    uint64_t req_end = (blk_num>0)?(req_start + blk_num * SYS_CACHE_SIZE):slot_sz;
++    uint64_t req_start = blk_start * sys_cache_sz;
++    uint64_t req_end = (blk_num>0)?(req_start + blk_num * sys_cache_sz):slot_sz;
+ 
+     // frag region
+     uint64_t frag_start = req_start + (uint64_t)req_frag * CMI_MAX_FRAGSIZE;
+@@ -100,8 +104,8 @@
+     }
+ 
+     // do caching
+-    cache_sz = MIN(SYS_CACHE_SIZE, slot_sz - frag_start);
+-    size_t cache_sz_repo = cache_sz / repo_num;
++    cache_sz = MIN(sys_cache_sz, slot_sz - frag_start);
++    size_t cache_sz_repo = cache_sz / pipe_num;
+     zlog_notice(sys_zc, "cache file: slot_id=%d, slot_sz=%zu, req_frag=%u, "
+                 "req=%lu+%lu, frag=%lu+%lu, cache_sz=%zu, blk=%lu+%lu",
+                 slot_id, slot_sz, req_frag,
+@@ -111,17 +115,21 @@
+ 
+     struct dfv_file* file_ctx = NULL;
+     void* file_buffer = memalign(SYS_INTERLACE_SIZE, cache_sz_repo);
+-    for (i=0; i<repo_num; i++) {
+-        struct dfv_repo * repo = ctx->vault->repo_tbl[i];
+-        assert(repo);
+-
+-        file_ctx = dfv_file_open(repo, slot_id, SPK_DIR_READ, NULL, 12+4*i);
++    for (i=0; i<pipe_num; i++) {
++        int repo_offset = i * pipe_repo_num;
++        dfv_slot_def_t slot_def;
++        for(j=0; j<pipe_repo_num; j++) {
++            slot_def.repo[j] = ctx->vault->repo_tbl[j+repo_offset];
++        }
++        slot_def.slot_id = slot_id;
++        slot_def.repo_num = pipe_repo_num;
++        file_ctx = dfv_file_open(&slot_def, SPK_DIR_READ, NULL, 8+slice_num*i);
+         if (!file_ctx) {
+             ret = SPKERR_BADRES;
+             goto out;
+         }
+ 
+-        ret = dfv_file_seek(file_ctx, frag_start / repo_num);
++        ret = dfv_file_seek(file_ctx, frag_start / pipe_num);
+         if (ret) {
+             goto out;
+         }
+@@ -137,7 +145,7 @@
+ 
+         // do interlace while copy data
+         for (j=0; j<cache_sz_repo/interlace_sz; j++) {
+-            memcpy(file_cache->data+(j*repo_num+i)*interlace_sz,
++            memcpy(file_cache->data+(j*pipe_num+i)*interlace_sz,
+                    file_buffer+j*interlace_sz,
+                    interlace_sz);
+         }
+@@ -167,7 +175,11 @@
+                                 uint64_t blk_num, uint32_t req_frag, int* eof_req)
+ {
+     sys_cache_t* file_cache = sys_ctx.file_cache;
+-    uint64_t req_start = blk_start * SYS_CACHE_SIZE;
++    int repo_num = syslk_mode.sys_repo_num;
++    int pipe_num = syslk_mode.sys_pipe_num;
++    int slice_num = syslk_mode.repo_slice_num;
++    size_t sys_cache_sz = (pipe_num * repo_num * slice_num * DFV_SLICE_SIZE);
++    uint64_t req_start = blk_start * sys_cache_sz;
+     uint64_t frag_start = req_start + (uint64_t)req_frag * CMI_MAX_FRAGSIZE;
+ 
+     if (file_cache->slot_id != slot_id ||
+@@ -175,7 +187,7 @@
+         assert(0);
+     }
+ 
+-    uint64_t req_end = (blk_num>0)?(req_start + blk_num * SYS_CACHE_SIZE):
++    uint64_t req_end = (blk_num>0)?(req_start + blk_num * sys_cache_sz):
+                        (file_cache->slot_sz);
+     uint64_t frag_end = frag_start + CMI_MAX_FRAGSIZE;
+ 
+@@ -223,22 +235,26 @@
+     spk_stats_t* stats = &wkr_ctx->stats;
+ 
+     void* chunk_buf = NULL;
+-    size_t chunk_size = slice_def->size * slice_def->num;
+-    int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
++    int repo_num = slot_def->repo_num;
++    size_t chunk_size = (slice_def->size * slice_def->num *repo_num);
++    int dfv_cpu_base = 8+slice_def->num*wkr_ctx->wkr_id;
+ 
+-    zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
++    int repo_id = 0;
++    for (repo_id=0; repo_id<repo_num; repo_id++) {
++        zlog_notice(sys_zc, "wkr#%d> prepare for recording: ips={0x%x:%d}, dfv={repo={%d:%d}, "
+                         "slice={%d, 0x%lx}, cpu_base=%d}",
+                         wkr_id,
+                         src_id, pc_id,
+-                        dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
++                        dfv_repo_get_id(slot_def->repo[repo_id]), slot_def->slot_id,
+                         slice_def->num, slice_def->size,
+                         dfv_cpu_base);
++    }
+ 
+     // reset stats
+     spk_stats_reset(stats);
+ 
+     // open dfv slot
+-    file_ctx = dfv_file_open(slot_def->repo, slot_def->slot_id, SPK_DIR_WRITE, slice_def,
++    file_ctx = dfv_file_open(slot_def, SPK_DIR_WRITE, slice_def,
+                              dfv_cpu_base);
+     if (!file_ctx) {
+         zlog_fatal(sys_zc, "wkr#%d> failed to open dfv file", wkr_id);
+@@ -252,14 +268,14 @@
+         size_t xferred = 0;
+         void * txbuf = NULL;
+ 
+-        txbuf = memalign(SYS_INTERLACE_SIZE, DFV_CHUNK_SIZE);
++        txbuf = memalign(SYS_INTERLACE_SIZE, chunk_size);
+         assert(txbuf);
+-        memset(txbuf, 0xfe, DFV_CHUNK_SIZE);
++        memset(txbuf, 0xfe, chunk_size);
+         while(xferred < warmup_sz) {
+-            ssize_t xfer = dfv_file_write(file_ctx, txbuf, DFV_CHUNK_SIZE);
+-            if (xfer != DFV_CHUNK_SIZE) {
+-                zlog_fatal(sys_zc, "wkr#%d> failed to write to dfv: xfer=%ld, expect=%u",
+-                                    wkr_id, xfer, DFV_CHUNK_SIZE);
++            ssize_t xfer = dfv_file_write(file_ctx, txbuf, chunk_size);
++            if (xfer != chunk_size) {
++                zlog_fatal(sys_zc, "wkr#%d> failed to write to dfv: xfer=%ld, expect=%lx",
++                                    wkr_id, xfer, chunk_size);
+                 ret = SPKERR_EACCESS;
+                 SAFE_RELEASE(txbuf);
+                 goto out;
+@@ -489,14 +505,22 @@
+     void * txbuf = NULL;
+     size_t txbuf_sz = 0;
+     int i;
+-    int dfv_cpu_base = 12+4*wkr_ctx->wkr_id;
+ 
+-    zlog_notice(sys_zc, "wkr#%d> prepare for playback: ips={0x%x:%d}, "
++    size_t chunk_size = 0;
++    int slice_num = syslk_mode.repo_slice_num;
++    int repo_num = slot_def->repo_num;
++    chunk_size = (repo_num*slice_num*DFV_SLICE_SIZE);
++    int dfv_cpu_base = 8+slice_num*wkr_ctx->wkr_id;
++    int repo_id = 0;
++    
++    for (repo_id = 0; repo_id < slot_def->repo_num; repo_id++) {
++        zlog_notice(sys_zc, "wkr#%d> prepare for playback: ips={0x%x:%d}, "
+                         "dfv={repo={%d:%d}, sz=%lu, cpu_base=%d}",
+                         wkr_id,
+                         src_id, pc_id,
+-                        dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
++                        dfv_repo_get_id(slot_def->repo[repo_id]), slot_def->slot_id,
+                         slot_sz, dfv_cpu_base);
++    }
+ 
+     // reset stats
+     spk_stats_reset(stats);
+@@ -521,12 +545,12 @@
+         stats = ips_chan_get_stats(pcctx);
+     }
+ 
+-    int dfvcm_buf_nodes = DFVCM_BUF_NODE_NUM;//
++    int dfvcm_buf_nodes = ((DFVCM_BUF_NODE_NUM)/(slice_num*repo_num));//
+     // we use ips's tx_buffers directly (for zero-copy)
+     // scratch bufs from ips
+     txbuf = ips_chan_get_txbuf(pcctx, &txbuf_sz);
+     // WARNING: IPS must allocated enough tx_buffer, so check it
+-    assert(txbuf && txbuf_sz >= dfvcm_buf_nodes*DFV_CHUNK_SIZE);
++    assert(txbuf && txbuf_sz >= dfvcm_buf_nodes*chunk_size);
+ 
+     // open dfv cache manager for read
+     dfvcm = dfvcm_open(wkr_id, slot_def, SPK_DIR_READ, NULL, dfv_cpu_base);
+@@ -539,8 +563,8 @@
+         assert(local_node[i]);
+         memset(local_node[i], 0, sizeof(dfv_bufq_node_t));
+         // points to txbuf
+-        local_node[i]->buf_ptr = txbuf + i*DFV_CHUNK_SIZE;
+-        local_node[i]->buf_sz = DFV_CHUNK_SIZE;
++        local_node[i]->buf_ptr = txbuf + i*chunk_size;
++        local_node[i]->buf_sz = chunk_size;
+         // enqueue to dfvcm's freeq
+         // dfvcm will start reading immediatly
+         dfv_bufq_enqueue(dfvcm_get_freeq(dfvcm), local_node[i]);
+@@ -554,7 +578,7 @@
+     uint64_t tm_log = now;
+     ret = SPK_SUCCESS;
+     uint64_t use_buf_num = 0;
+-    int  current_buf_num = DFVCM_BUF_NODE_NUM;
++    int  current_buf_num = dfvcm_buf_nodes;
+     int dfv_status = 0;
+     while(!wkr_ctx->reset_req) {
+         // dequeue buffers from dfvcm
+@@ -563,11 +587,11 @@
+         }
+         dfv_bufq_node_t* node = dfv_bufq_dequeue(dfvcm_get_workq(dfvcm));
+         if (syslk_ips_mode.dma_use_chain) {
+-            if(current_buf_num <= 4) {
+-                int free_buf_num = ips_chan_get_tx_freebn(pcctx, DFV_CHUNK_SIZE);
++            if(current_buf_num <= (dfvcm_buf_nodes/2)) {
++                int free_buf_num = ips_chan_get_tx_freebn(pcctx, chunk_size);
+                 if(free_buf_num > 0) {
+                     for(i=0; i<free_buf_num; i++) {
+-                        int index = (use_buf_num % (DFVCM_BUF_NODE_NUM));
++                        int index = (use_buf_num % dfvcm_buf_nodes);
+                         dfv_bufq_enqueue(dfvcm_get_freeq(dfvcm), local_node[index]);
+                         use_buf_num++;
+                         current_buf_num++;
+@@ -718,12 +742,12 @@
+     IPS_EPID epid = pcdesc->src_id;
+ 
+     dfv_vault_t* vault = ctx->vault;
+-    struct dfv_repo* repo = vault->repo_tbl[dfv_pipe_id];
+     size_t ips_sec_sz = pcdesc->sector_sz;
++    int repo_num = syslk_mode.sys_repo_num;
+ 
+     dfv_slice_def_t slice_def;
+     memset(&slice_def, 0, sizeof(dfv_slice_def_t));
+-    slice_def.num = DFV_SLICE_NUM;
++    slice_def.num = syslk_mode.repo_slice_num;
+     slice_def.size = DFV_SLICE_SIZE;
+ 
+     dfv_slot_def_t slot_def;
+@@ -759,7 +783,13 @@
+             // start_rec: deferred job
+             int slot_id = (int)(intptr_t)job_node->arg;
+             memset(&slot_def, 0, sizeof(dfv_slot_def_t));
+-            slot_def.repo = repo;
++            int repo_index = 0;
++            int repo_id = (dfv_pipe_id*repo_num);
++            for (repo_index=0; repo_index < repo_num; repo_index++) {
++                slot_def.repo[repo_index] = vault->repo_tbl[repo_id];
++                repo_id++;
++            }
++            slot_def.repo_num = repo_num;
+             slot_def.slot_id = slot_id;
+             __JOB_RESPONSE(sys_state_rec, SPK_SUCCESS);
+             spk_stats_reset(&wkr_ctx->stats);
+@@ -774,7 +804,13 @@
+             __JOB_RESPONSE(sys_state_play, SPK_SUCCESS);
+             spk_stats_reset(&wkr_ctx->stats);
+             memset(&slot_def, 0, sizeof(dfv_slot_def_t));
+-            slot_def.repo = repo;
++            int repo_index = 0;
++            int repo_id = (dfv_pipe_id*repo_num);
++            for (repo_index=0; repo_index < repo_num; repo_index++) {
++                slot_def.repo[repo_index] = vault->repo_tbl[repo_id];
++                repo_id++;
++            }
++            slot_def.repo_num = repo_num;
+             slot_def.slot_id = slot_id;
+             ret = __sys_job_do_playback(wkr_ctx,
+                                         epid, ips_pcid, ips_sec_sz,
+Index: src/syslk/syslk.c
+===================================================================
+--- src/syslk/syslk.c	(revision 80)
++++ src/syslk/syslk.c	(working copy)
+@@ -33,6 +33,15 @@
+     .rx.use_wptr = 1,
+     .rx.use_rptr = 1
+ };
++
++sys_mode_t syslk_mode = {
++    .sys_pipe_num = SYS_MAX_PIPES,
++    .sys_repo_num = 1,
++    .repo_slice_num = DFV_SLICE_NUM,
++    .mnt_path = {"dfa", "dfb"},
++    .dev_path = {"scta", "sctb"},
++};
++
+ // lktm
+ //  sec: [0: 5] - 6bit
+ //  min: [6:11] - 6bit
+@@ -101,9 +110,10 @@
+         ret = SPKERR_BADSEQ;
+         goto out;
+     }
++    int pipe_num = syslk_mode.sys_pipe_num;
+ 
+-    assert(!(DATA_FRAGLEN(msg) % (SYS_MAX_PIPES*SYS_INTERLACE_SIZE)));
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    assert(!(DATA_FRAGLEN(msg) % (pipe_num*SYS_INTERLACE_SIZE)));
++    for (i=0; i<pipe_num; i++) {
+         sys_ul_ctx_t* ul_ctx = sys_ctx.ul_ctx_tbl[i];
+         assert(ul_ctx);
+         assert(ul_ctx->dfvcm);
+@@ -131,7 +141,7 @@
+                    data_ptr,
+                    SYS_INTERLACE_SIZE);
+             node->buf_offset += SYS_INTERLACE_SIZE;
+-            data_ptr += (SYS_MAX_PIPES*SYS_INTERLACE_SIZE);
++            data_ptr += (pipe_num*SYS_INTERLACE_SIZE);
+         }
+         if (node->buf_offset >= node->buf_sz || DATA_EOF(msg)) {
+             // FIXME: payload_size & buf_size alignment check
+@@ -308,7 +318,8 @@
+     FILE *fp = NULL;
+     uint8_t value = 0;
+     char data[KEYVALLEN];
+-    int ret = -1;
++    char pathname[SPK_MAX_PATHNAME];
++    int i, ret = -1;
+ 
+     if ((fp = fopen(filename, "r")) == NULL) {
+         fprintf(stderr, "can not open %s", filename);
+@@ -356,13 +367,50 @@
+         syslk_ips_mode.rx.use_rptr = value; 
+     }
+ 
++    fseek(fp, 0, SEEK_SET);
++    ret = syslk_parse_keyval(fp, "sys_pipe_num", data);
++    if (ret == 0) {
++        value = atoi(data);
++        syslk_mode.sys_pipe_num = value; 
++    }
++
++    fseek(fp, 0, SEEK_SET);
++    ret = syslk_parse_keyval(fp, "sys_repo_num", data);
++    if (ret == 0) {
++        value = atoi(data);
++        syslk_mode.sys_repo_num = value; 
++    }
++    
++    fseek(fp, 0, SEEK_SET);
++    ret = syslk_parse_keyval(fp, "repo_slice_num", data);
++    if (ret == 0) {
++        value = atoi(data);
++        syslk_mode.repo_slice_num = value; 
++    }
++
++    for (i=0; i<syslk_mode.sys_pipe_num; i++) {
++        fseek(fp, 0, SEEK_SET);
++        sprintf(pathname, "%s%d", "mnt_path", i);
++        ret = syslk_parse_keyval(fp, pathname, data);
++        if (ret == 0) {
++            strcpy(syslk_mode.mnt_path[i], data);
++        }
++
++        fseek(fp, 0, SEEK_SET);
++        sprintf(pathname, "%s%d", "dev_path", i);
++        ret = syslk_parse_keyval(fp, pathname, data);
++        if (ret == 0) {
++            strcpy(syslk_mode.dev_path[i], data);
++        }
++    }
++
+     fclose(fp);
+ }
+ 
+ int main(int argc, char **argv)
+ {
+     int ret;
+-    int i;
++    int i,j;
+     char msg_ibuf[CMI_MAX_MSGSIZE];
+ 
+     umask(022);
+@@ -370,7 +418,6 @@
+     // build assert
+     assert(DFV_MAX_SLOTS == CMI_MAX_SLOTS);
+     assert(IPS_MAX_FCNUM == CMI_MAX_FCNUM);
+-    assert(!(SYS_CACHE_SIZE % CMI_MAX_FRAGSIZE));
+ 
+     printf("\n");
+     printf("SSSSSSSSSS\n");
+@@ -392,6 +439,19 @@
+     zlog_init("./zlog.conf");
+     sys_zc = zlog_get_category("SYS");
+     assert(sys_zc);
++    
++    //init ips and syslk  mode
++    syslk_parse_ips_mode("./syslk_ips.conf");
++    ips_init_mode(syslk_ips_mode);
++    int repo_num = syslk_mode.sys_repo_num;
++    int pipe_num = syslk_mode.sys_pipe_num;
++    int slice_num = syslk_mode.repo_slice_num;
++    zlog_notice(sys_zc,"dma_use_nlwr:%d dma_use_chain:%d tx_wmd:%d tx_rmd:%d rx_wmd:%d rx_rmd:%d",
++                syslk_ips_mode.dma_use_nlwr, syslk_ips_mode.dma_use_chain, syslk_ips_mode.tx.use_wptr,
++                syslk_ips_mode.tx.use_rptr, syslk_ips_mode.rx.use_wptr, syslk_ips_mode.rx.use_rptr);    
++    zlog_notice(sys_zc,"syslk_pipe_num:%d syslk_repo_num:%d repo_slice_num:%d mnt_path0:%s dev_path0:%s mnt_path1:%s dev_path1:%s",
++                pipe_num, repo_num, slice_num, syslk_mode.mnt_path[0], syslk_mode.dev_path[0],
++                syslk_mode.mnt_path[1], syslk_mode.dev_path[1]);
+ 
+     zlog_notice(sys_zc, "------------------------------------------");
+     zlog_notice(sys_zc, "==> system starting ...");
+@@ -402,6 +462,13 @@
+     zlog_notice(sys_zc, "  IDT: %s", IDT_MOD_VER);
+     zlog_notice(sys_zc, "  CMI: %s", CMI_MOD_VER);
+ 
++    if ((pipe_num > SYS_MAX_PIPES) || (pipe_num <= 0) || (slice_num <= 0) 
++        || (repo_num <= 0) || ((repo_num*pipe_num*slice_num ) > 32)) {
++        zlog_fatal(sys_zc,"fatal error: syslk_pipe_num:%d syslk_repo_num:%d, repo_slice_num:%d",
++                pipe_num, repo_num, slice_num);
++        exit(-1);
++    }
++    int total_repo_num = pipe_num * repo_num;
+     // initialize env
+     // TBD: should be read from .conf
+     zlog_notice(sys_zc, "> loading conf ...");
+@@ -414,12 +481,9 @@
+     sys_env.ipaddr = NULL;
+     sys_env.port = 1235;
+ 
+-    sys_env.dfv_desc_tbl[0].mnt_path = "dfa";
+-    sys_env.dfv_desc_tbl[0].dev_path = "scta";
++    sys_env.dfv_desc_tbl[0].mnt_path = syslk_mode.mnt_path[0];
++    sys_env.dfv_desc_tbl[0].dev_path = syslk_mode.dev_path[0];
+     sys_env.dfv_desc_tbl[0].flag = 0;
+-    sys_env.dfv_desc_tbl[1].mnt_path = "dfb";
+-    sys_env.dfv_desc_tbl[1].dev_path = "sctb";
+-    sys_env.dfv_desc_tbl[1].flag = 0;
+ 
+     sys_env.ips_linkdesc_tbl[0].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 0);
+     sys_env.ips_linkdesc_tbl[0].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 0);
+@@ -427,14 +491,28 @@
+     sys_env.ips_linkdesc_tbl[0].slv_port = 6;
+     sys_env.ips_linkdesc_tbl[0].is_master = 1;
+ 
+-    sys_env.ips_linkdesc_tbl[1].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 1);
+-    sys_env.ips_linkdesc_tbl[1].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 1);
+-    sys_env.ips_linkdesc_tbl[1].mst_port = 4;
+-    sys_env.ips_linkdesc_tbl[1].slv_port = 3;
+-    sys_env.ips_linkdesc_tbl[1].is_master = 1;
++    if (pipe_num == 2) {
++        sys_env.dfv_desc_tbl[1].mnt_path = syslk_mode.mnt_path[1];
++        sys_env.dfv_desc_tbl[1].dev_path = syslk_mode.dev_path[1];
++        sys_env.dfv_desc_tbl[1].flag = 0;
++        sys_env.ips_linkdesc_tbl[1].mst_id = IPS_MAKE_EPID(IPS_EPMODE_MASTER, 0, 1);
++        sys_env.ips_linkdesc_tbl[1].slv_id = IPS_MAKE_EPID(IPS_EPMODE_SLAVE, 0, 1);
++        sys_env.ips_linkdesc_tbl[1].mst_port = 4;
++        sys_env.ips_linkdesc_tbl[1].slv_port = 3;
++        sys_env.ips_linkdesc_tbl[1].is_master = 1;
++        assert(sys_env.ips_linkdesc_tbl[1].is_master); // I am master
++        sys_env.ips_desc_tbl[1].capacity = 0;
++        sys_env.ips_desc_tbl[1].pc_num = 1;
++        for (i = 0; i < 1; i++) {
++            ips_pcdesc_t* pcdesc = &sys_env.ips_desc_tbl[1].pcdesc_tbl[i];
++            pcdesc->src_id = sys_env.ips_linkdesc_tbl[1].mst_id;
++            pcdesc->dest_id = sys_env.ips_linkdesc_tbl[1].slv_id;
++            pcdesc->sector_sz = IPS_CLS_SECTOR_SIZE;
++            pcdesc->sector_num = IPS_CLS_SECTOR_NUM;
++        }
++    }
+ 
+     assert(sys_env.ips_linkdesc_tbl[0].is_master); // I am master
+-    assert(sys_env.ips_linkdesc_tbl[1].is_master); // I am master
+ 
+     sys_env.ips_desc_tbl[0].capacity = 0;
+     sys_env.ips_desc_tbl[0].pc_num = 1;
+@@ -446,16 +524,6 @@
+         pcdesc->sector_num = IPS_CLS_SECTOR_NUM;
+     }
+ 
+-    sys_env.ips_desc_tbl[1].capacity = 0;
+-    sys_env.ips_desc_tbl[1].pc_num = 1;
+-    for (i = 0; i < 1; i++) {
+-        ips_pcdesc_t* pcdesc = &sys_env.ips_desc_tbl[1].pcdesc_tbl[i];
+-        pcdesc->src_id = sys_env.ips_linkdesc_tbl[1].mst_id;
+-        pcdesc->dest_id = sys_env.ips_linkdesc_tbl[1].slv_id;
+-        pcdesc->sector_sz = IPS_CLS_SECTOR_SIZE;
+-        pcdesc->sector_num = IPS_CLS_SECTOR_NUM;
+-    }
+-
+     // initialize each module
+     zlog_notice(sys_zc, "==> initializing modules ...");
+ #ifdef ARCH_ppc64
+@@ -469,23 +537,34 @@
+     ret = cmi_module_init(NULL);
+     assert(!ret);
+ 
+-    //init ips mode
+-    syslk_parse_ips_mode("./syslk_ips.conf");
+-    ips_init_mode(syslk_ips_mode);
+-    zlog_notice(sys_zc,"dma_use_nlwr:%d dma_use_chain:%d tx_wmd:%d tx_rmd:%d rx_wmd:%d rx_rmd:%d",
+-                syslk_ips_mode.dma_use_nlwr, syslk_ips_mode.dma_use_chain, syslk_ips_mode.tx.use_wptr,
+-                syslk_ips_mode.tx.use_rptr, syslk_ips_mode.rx.use_wptr, syslk_ips_mode.rx.use_rptr);    
+     // initialize ctxs
+     memset(&sys_ctx, 0, sizeof(sys_ctx));
+ 
+     zlog_notice(sys_zc, "==> initializing storage ...");
+     const char* repo_mnt_tbl[DFV_MAX_REPOS] = {NULL};
+     const char* repo_dev_tbl[DFV_MAX_REPOS] = {NULL};
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
+-        repo_mnt_tbl[i] = sys_env.dfv_desc_tbl[i].mnt_path;
+-        repo_dev_tbl[i] = sys_env.dfv_desc_tbl[i].dev_path;
++    
++    char mnt_path[DFV_MAX_REPOS][SPK_MAX_PATHNAME];
++    char dev_path[DFV_MAX_REPOS][SPK_MAX_PATHNAME];
++    for (i=0; i<pipe_num; i++) {
++        char tmp_mpath[SPK_MAX_PATHNAME];
++        char tmp_dpath[SPK_MAX_PATHNAME];
++        strcpy(tmp_mpath, sys_env.dfv_desc_tbl[i].mnt_path);
++        strcpy(tmp_dpath, sys_env.dfv_desc_tbl[i].dev_path);
++        int ml_id = strlen(tmp_mpath) - 1;
++        int dl_id = strlen(tmp_dpath) - 1;
++        for(j=0; j<repo_num; j++) {
++            int index= j+ (i*repo_num);
++            strcpy(mnt_path[index], tmp_mpath);
++            strcpy(dev_path[index], tmp_dpath);
++            repo_mnt_tbl[index] = mnt_path[index];
++            repo_dev_tbl[index] = dev_path[index];
++            tmp_mpath[ml_id]++;
++            tmp_dpath[dl_id]++;
++            zlog_notice(sys_zc, "index:%d mnt_path:%s dev_path:%s", index, repo_mnt_tbl[index], repo_dev_tbl[index]);
++        }
+     }
+-    sys_ctx.vault = dfv_vault_open(SYS_MAX_PIPES, repo_mnt_tbl, repo_dev_tbl, 0);
++    sys_ctx.vault = dfv_vault_open(total_repo_num, repo_mnt_tbl, repo_dev_tbl, 0);
+     if (!sys_ctx.vault) {
+         zlog_fatal(sys_zc, "failed to initializing storage, quit");
+         exit(-1);
+@@ -502,7 +581,7 @@
+     zlog_notice(sys_zc, "==> initializing switch route table ...");
+     int idt_fd = idt_dev_open(2, 0x67);
+     assert(idt_fd > 0);
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         ips_linkdesc_t* linkdesc = &sys_env.ips_linkdesc_tbl[i];
+         // reset link parnter
+ //        idt_port_recovery(idt_fd, linkdesc->slv_port);
+@@ -517,7 +596,7 @@
+     idt_dev_close(idt_fd);
+ 
+     zlog_notice(sys_zc, "==> initializing srio ...");
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         // init repo
+         zlog_notice(sys_zc, "  initializing ips_srio: pipe=%d, id=0x%x",
+                     i,
+@@ -530,11 +609,13 @@
+     assert(sys_ctx.file_cache);
+     memset(sys_ctx.file_cache, 0, sizeof(sys_cache_t));
+     sys_ctx.file_cache->slot_id = -1;
+-    sys_ctx.file_cache->data = malloc(SYS_CACHE_SIZE);
++    size_t sys_cache_sz = (pipe_num * repo_num * slice_num * DFV_SLICE_SIZE);
++    zlog_notice(sys_zc, "cache size:0x%lx", sys_cache_sz);
++    sys_ctx.file_cache->data = malloc(sys_cache_sz);
+     assert(sys_ctx.file_cache->data);
+ 
+     zlog_notice(sys_zc, "==> initializing job workers ...");
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         sys_wkr_ctx_t* wkr_ctx = malloc(sizeof(sys_wkr_ctx_t));
+         assert(wkr_ctx);
+         memset(wkr_ctx, 0, sizeof(sys_wkr_ctx_t));
+@@ -560,7 +641,7 @@
+ RECONN:
+     zlog_notice(sys_zc, "==> ---------- SERVER START ----------");
+     // stop all workers
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         sys_wkr_ctx_t* wkr_ctx = sys_ctx.wkr_ctx_tbl[i];
+         if (wkr_ctx->wkr_state != sys_state_idle) {
+             zlog_notice(sys_zc, "==> stopping job worker#%d ...", i);
+@@ -616,7 +697,7 @@
+             case sys_state_format:
+                 {
+                     int all_idle = 1;
+-                    for (int i=0; i<SYS_MAX_PIPES; i++) {
++                    for (int i=0; i<pipe_num; i++) {
+                         sys_wkr_ctx_t* wkr_ctx = sys_ctx.wkr_ctx_tbl[i];
+                         if (wkr_ctx && wkr_ctx->wkr_state != sys_state_idle) {
+                             all_idle = 0;
+@@ -681,7 +762,7 @@
+     }
+ 
+ out:
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         sys_wkr_ctx_t* wkr_ctx = sys_ctx.wkr_ctx_tbl[i];
+         if (wkr_ctx) {
+             wkr_ctx->quit_req = 1;
+Index: src/syslk/syslk_cmd.c
+===================================================================
+--- src/syslk/syslk_cmd.c	(revision 80)
++++ src/syslk/syslk_cmd.c	(working copy)
+@@ -76,6 +76,7 @@
+     status.sys_state = sys_ctx.sys_state;
+     status.svr_time = sys_systm_to_lktm(time(NULL));
+ 
++    int pipe_num = syslk_mode.sys_pipe_num;
+     if (!(sys_env.features & SYSFEA_USE_LOCALSTATS)) {
+         // update fcstat from srio#0
+         ips_fcstat_lk1* fcstat = &sys_ctx.fcstat[0];
+@@ -90,7 +91,7 @@
+             status.fb_count[i] = fcstat->recv_sz_16b[i] << 1;
+         }
+     } else {
+-        for (i=0; i<SYS_MAX_PIPES; i++) {
++        for (i=0; i<pipe_num; i++) {
+             sys_wkr_ctx_t* wkr_ctx = sys_ctx.wkr_ctx_tbl[i];
+             if (wkr_ctx) {
+                 status.fb_count[i] = spk_stats_get_xfer_bytes(&wkr_ctx->stats) / 1024;
+@@ -162,14 +163,15 @@
+ 
+ static int sys_cmd_send_snapshot(cmi_cmd_t* cmd)
+ {
+-    size_t buf_snap_sz_all = SYS_MAX_PIPES*SYS_SNAP_BUF_SZ;
++    int pipe_num = syslk_mode.sys_pipe_num;
++    size_t buf_snap_sz_all = pipe_num*SYS_SNAP_BUF_SZ;
+     char* buf_snap = NULL;
+     int ret = -1;
+ 
+     buf_snap = malloc(buf_snap_sz_all);
+     assert(buf_snap);
+ 
+-    for (int i=0; i<SYS_MAX_PIPES; i++) {
++    for (int i=0; i<pipe_num; i++) {
+         sys_wkr_ctx_t* wkr_ctx = sys_ctx.wkr_ctx_tbl[i];
+         if (wkr_ctx) {
+             pthread_mutex_lock(&wkr_ctx->buf_snap_lock);
+@@ -231,12 +233,13 @@
+         goto out;
+     }
+ 
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    int pipe_num = syslk_mode.sys_pipe_num;
++    for (i=0; i<pipe_num; i++) {
+         sys_job_kickoff(i, cmd_type_start_rec, cmd, slot_id);
+     }
+ 
+     ret = SPK_SUCCESS;
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         int ret2 = sys_job_wait_resp(i, cmd_type_start_rec);
+         if (ret2 != SPK_SUCCESS) {
+             ret = ret2;
+@@ -270,12 +273,13 @@
+     slot_sz /= ctx->vault->repo_num;
+ 
+     // drive worker
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    int pipe_num = syslk_mode.sys_pipe_num;
++    for (i=0; i<pipe_num; i++) {
+         sys_job_kickoff(i, cmd_type_start_play, cmd, slot_sz);
+     }
+ 
+     ret = SPK_SUCCESS;
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         int ret2 = sys_job_wait_resp(i, cmd_type_start_play);
+         if (ret2 != SPK_SUCCESS) {
+             ret = ret2;
+@@ -313,7 +317,8 @@
+ {
+     int i;
+ 
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    int pipe_num = syslk_mode.sys_pipe_num;
++    for (i=0; i<pipe_num; i++) {
+         sys_ul_ctx_t* ul_ctx = sys_ctx.ul_ctx_tbl[i];
+         if (ul_ctx) {
+             if (ul_ctx->dfvcm) {
+@@ -343,7 +348,12 @@
+         return(SPKERR_EAGAIN);
+     }
+ 
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    int pipe_num = syslk_mode.sys_pipe_num;
++    int repo_num = syslk_mode.sys_repo_num;
++    int slice_num = syslk_mode.repo_slice_num;
++    
++    size_t chunk_size = slice_num* repo_num * DFV_SLICE_SIZE;
++    for (i=0; i<pipe_num; i++) {
+         if (ctx->ul_ctx_tbl[i]) {
+             assert(0);
+         }
+@@ -355,29 +365,33 @@
+         goto errout;
+     }
+ 
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         sys_ul_ctx_t* ul_ctx = malloc(sizeof(sys_ul_ctx_t));
+         assert(ul_ctx);
+         memset(ul_ctx, 0, sizeof(sys_ul_ctx_t));
+ 
+         struct dfvcm_ctx* dfvcm = NULL;
+         dfv_slot_def_t slot_def;
+-        slot_def.repo = dfv_vault_get_repo(ctx->vault, i);
++        int repo_id=0;
++        for (repo_id=0; repo_id<repo_num; repo_id++) {
++            slot_def.repo[repo_id] = dfv_vault_get_repo(ctx->vault, ((i * repo_num)+repo_id));
++        }
++        slot_def.repo_num = repo_num;
++
+         slot_def.slot_id = slot_id;
+-
+         dfv_slice_def_t slice_def;
+-        slice_def.num = DFV_SLICE_NUM;
++        slice_def.num = slice_num;
+         slice_def.size = DFV_SLICE_SIZE;
+ 
+-        dfvcm = dfvcm_open(i, &slot_def, SPK_DIR_WRITE, &slice_def, 16+i*DFV_SLICE_NUM);
++        dfvcm = dfvcm_open(i, &slot_def, SPK_DIR_WRITE, &slice_def, 16+i*slice_num);
+         if (!dfvcm) {
+             ret = SPKERR_BADRES;
+             goto errout;
+         }
+-
+-        void* buf_ptr = memalign(SYS_INTERLACE_SIZE, DFV_CHUNK_SIZE);
++        
++        void* buf_ptr = memalign(SYS_INTERLACE_SIZE, chunk_size);
+         if (!buf_ptr) {
+-            zlog_fatal(sys_zc, "not enough memroy: size_req=0x%x", DFV_CHUNK_SIZE);
++            zlog_fatal(sys_zc, "not enough memroy: size_req=0x%lx", chunk_size);
+             assert(0);
+         }
+ 
+@@ -385,7 +399,7 @@
+         assert(node);
+         memset(node, 0, sizeof(dfv_bufq_node_t));
+         node->buf_ptr = buf_ptr;
+-        node->buf_sz = DFV_CHUNK_SIZE;
++        node->buf_sz = chunk_size;
+ 
+         dfv_bufq_t* freeq = dfvcm_get_freeq(dfvcm);
+         dfv_bufq_enqueue(freeq, node);
+@@ -473,13 +487,14 @@
+         return(SPKERR_EAGAIN);
+     }
+ 
++    int pipe_num = syslk_mode.sys_pipe_num;
+     // drive worker
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         sys_job_kickoff(i, cmd_type_config, cmd, 0);
+     }
+ 
+     ret = SPK_SUCCESS;
+-    for (i=0; i<SYS_MAX_PIPES; i++) {
++    for (i=0; i<pipe_num; i++) {
+         int ret2 = sys_job_wait_resp(i, cmd_type_config);
+         if (ret2 != SPK_SUCCESS) {
+             ret = ret2;
+@@ -529,19 +544,20 @@
+ 
+     zlog_info(sys_zc, "> executing cmd: type=%s", cmi_desc_cmdtype2str(cmdtype));
+ 
++    int pipe_num = syslk_mode.sys_pipe_num;
+     // pre-exec
+     switch(cmdtype) {
+     case cmd_type_start_rec:
+         ret = sys_cmd_exec_startrec(cmd);
+         break;
+     case cmd_type_stop_rec:
+-        ret = sys_cmd_exec_stop(cmd, SYS_MAX_PIPES, sys_state_rec);
++        ret = sys_cmd_exec_stop(cmd, pipe_num, sys_state_rec);
+         break;
+     case cmd_type_start_play:
+         ret = sys_cmd_exec_startplay(cmd);
+         break;
+     case cmd_type_stop_play:
+-        ret = sys_cmd_exec_stop(cmd, SYS_MAX_PIPES, sys_state_play);
++        ret = sys_cmd_exec_stop(cmd, pipe_num, sys_state_play);
+         break;
+     case cmd_type_snapshot:
+         ret = sys_cmd_exec_snapshot(cmd);
+@@ -669,7 +685,8 @@
+         }
+         usleep(100);
+         int wkr_state = sys_state_idle;
+-        for (int i=0; i<SYS_MAX_PIPES; i++) {
++        int pipe_num = syslk_mode.sys_pipe_num;
++        for (int i=0; i<pipe_num; i++) {
+             sys_wkr_ctx_t* wkr_ctx = sys_ctx.wkr_ctx_tbl[i];
+             if (wkr_ctx && wkr_ctx->wkr_state != sys_state_idle) {
+                 wkr_state = wkr_ctx->wkr_state;
+Index: src/syslk/syslk.h
+===================================================================
+--- src/syslk/syslk.h	(revision 80)
++++ src/syslk/syslk.h	(working copy)
+@@ -8,7 +8,7 @@
+ 
+ #define SYS_VERSION_MAJOR   0
+ #define SYS_VERSION_MINOR   9
+-#define SYS_VERSION_DATE    160711
++#define SYS_VERSION_DATE    160906
+ 
+ #define SYS_VERSION         MAKE_VER_STR(SYS_VERSION_MAJOR, SYS_VERSION_MINOR, SYS_VERSION_DATE)
+ #define SYS_VERSION_INT     MAKE_VER_INT(SYS_VERSION_MAJOR, SYS_VERSION_MINOR, SYS_VERSION_DATE)
+@@ -19,10 +19,8 @@
+ 
+ #define DFV_SLICE_SIZE      (4*1024*1024)
+ #define DFV_SLICE_NUM       (4)
+-#define DFV_CHUNK_SIZE      (DFV_SLICE_SIZE*DFV_SLICE_NUM)
+ 
+-#define DFVCM_BUF_NODE_NUM  (8)
+-#define SYS_CACHE_SIZE      (DFV_CHUNK_SIZE*SYS_MAX_PIPES)
++#define DFVCM_BUF_NODE_NUM  (32)
+ 
+ #define SYS_INTERLACE_SIZE  (4*1024)
+ #define SYS_SNAP_BUF_SZ     (SYS_INTERLACE_SIZE)
+@@ -123,10 +121,20 @@
+     int sysdown_req;
+ } sys_ctx_t;
+ 
++typedef struct
++{
++    int sys_pipe_num;
++    int sys_repo_num;
++    int repo_slice_num;
++    char mnt_path[SYS_MAX_PIPES][SPK_MAX_PATHNAME];
++    char dev_path[SYS_MAX_PIPES][SPK_MAX_PATHNAME];
++} sys_mode_t;
++
+ extern zlog_category_t* sys_zc;
+ extern sys_env_t sys_env;
+ extern sys_ctx_t sys_ctx;
+ extern ips_mode_t syslk_ips_mode;
++extern sys_mode_t syslk_mode;
+ extern uint64_t sys_fpga_stat[2];
+ 
+ int sys_cmd_exec(cmi_cmd_t* cmd, size_t size);
+Index: src/libdfv/dfv_cm.c
+===================================================================
+--- src/libdfv/dfv_cm.c	(revision 80)
++++ src/libdfv/dfv_cm.c	(working copy)
+@@ -90,11 +90,14 @@
+ 
+     dfvcm_ctx_t* ctx = NULL;
+         
+-    zlog_notice(dfv_zc, "dfvcm#%d> open: repo={%d:%d}, dir=%s, slice={%d, 0x%lx}",
+-                         id,
+-                         dfv_repo_get_id(slot_def->repo), slot_def->slot_id,
+-                         spk_desc_dir2str(dir),
+-                         slice_def?slice_def->num:0, slice_def?slice_def->size:0);
++    int repo_num = 0;
++    for (repo_num = 0; repo_num < slot_def->repo_num; repo_num++) {
++        zlog_notice(dfv_zc, "dfvcm#%d> open: repo={%d:%d}, dir=%s, slice={%d, 0x%lx}",
++                             id,
++                             dfv_repo_get_id(slot_def->repo[repo_num]), slot_def->slot_id,
++                             spk_desc_dir2str(dir),
++                             slice_def?slice_def->num:0, slice_def?slice_def->size:0);
++    }
+ 
+     ctx = malloc(sizeof(dfvcm_ctx_t));
+     assert(ctx);
+@@ -104,12 +107,14 @@
+     ctx->dir = dir;
+     ctx->cpu_base = cpu_base;
+     if (dir == SPK_DIR_READ) {
+-        ctx->slot_sz = dfv_repo_get_slotsize(slot_def->repo, slot_def->slot_id);
+-        if (ctx->slot_sz <= 0) {
+-            goto errout;
++        for (repo_num = 0; repo_num < slot_def->repo_num; repo_num++) {
++            ctx->slot_sz += dfv_repo_get_slotsize(slot_def->repo[repo_num], slot_def->slot_id);
++            if (ctx->slot_sz <= 0) {
++                goto errout;
++            }
+         }
+     }
+-    ctx->file = dfv_file_open(slot_def->repo, slot_def->slot_id, dir, slice_def, cpu_base);
++    ctx->file = dfv_file_open(slot_def, dir, slice_def, cpu_base);
+     if (!ctx->file) {
+         goto errout;
+     }
+@@ -187,4 +192,4 @@
+ int dfvcm_get_id(dfvcm_ctx_t* ctx)
+ {
+     return(ctx->id);
+-}
+\ No newline at end of file
++}
+Index: src/libdfv/dfv_file.c
+===================================================================
+--- src/libdfv/dfv_file.c	(revision 80)
++++ src/libdfv/dfv_file.c	(working copy)
+@@ -16,7 +16,7 @@
+ static void* __dfv_slice_worker(void* arg)
+ {
+     dfv_slice_ctx_t* slice_ctx = (dfv_slice_ctx_t*)arg;
+-    int slice_num = slice_ctx->fmeta->slice_num;
++    int slice_num = slice_ctx->fmeta->total_slice_num;
+     int slice_id = slice_ctx->slice_id;
+     int cpu_base = slice_ctx->cpu_base;
+     assert(slice_ctx->fd > 0);
+@@ -49,7 +49,7 @@
+ 
+         // check chunk_size and slice_sz
+         if ((chunk_size % slice_num) ||
+-            (slice_sz & (0x4000-1))) { // 16k alignment
++            (slice_sz & (0x2000-1))) { // 8k alignment
+             zlog_error(dfv_zc, "illegal chunk_sz: chunk_sz=%zu, slice_num=%d",
+                         chunk_size, slice_num);
+             access = SPKERR_PARAM;
+@@ -97,114 +97,124 @@
+     return(NULL);
+ }
+ 
+-dfv_file_t* dfv_file_open(dfv_repo_t* repo, int slot_id, SPK_DIR dir, dfv_slice_def_t* slice_def, int cpu_base)
++dfv_file_t* dfv_file_open(dfv_slot_def_t* slot_def, SPK_DIR dir, dfv_slice_def_t* slice_def, int cpu_base)
+ {
+     char pathname[SPK_MAX_PATHNAME];
+-    int i;
++    int i, j;
+     int fd;
+-    dfv_rmeta_t* rmeta = &repo->rmeta;
++    dfv_rmeta_t* rmeta = NULL;
+     dfv_fmeta_t* fmeta = NULL;
++    int slot_id = slot_def->slot_id;
++    int repo_num = slot_def->repo_num;
+     
+-    assert(rmeta);
+     assert(dir == SPK_DIR_READ || dir == SPK_DIR_WRITE);
+     assert(slot_id >= 0 && slot_id < DFV_MAX_SLOTS);
+     if (dir == SPK_DIR_WRITE) {
+-        assert(slice_def->num > 0 && slice_def->num <= DFV_MAX_SLICES);
++        assert(slice_def->num > 0 && repo_num > 0 
++               && (slice_def->num*repo_num) <= DFV_MAX_SLICES);
+     } else {
+         assert(slice_def == NULL);
+     }
+     
+-    // check file exists
+-    sprintf(pathname, "%s/%d", repo->root_path, slot_id);
+-    fmeta = rmeta->fmeta_tbl[slot_id];
+-    if (dir == SPK_DIR_READ) {
+-        if (!fmeta) {
+-            zlog_error(dfv_zc, "file not found: slot_id=%d", slot_id);
+-            return(NULL);
+-        }
+-        struct stat info;
+-        if (stat(pathname, &info)) {
+-            zlog_error(dfv_zc, "file entry not found: entry=%s", pathname);
+-            return(NULL);
+-        } 
+-    } else {
+-        // write
+-        if (fmeta) {
+-            zlog_error(dfv_zc, "file already exists: slot_id=%d", slot_id);
+-            return(NULL);
+-        }
+-        if (mkdir(pathname, 0666)) {
+-            zlog_error(dfv_zc, "failed to create file entry: entry=%s, errmsg=%s",
+-                        pathname,
+-                        strerror(errno));
+-            return(NULL);
+-        }
+-        fmeta = malloc(sizeof(dfv_fmeta_t));
+-        memset(fmeta, 0, sizeof(dfv_fmeta_t));
+-        fmeta->slot_id = slot_id;
+-        fmeta->slice_num = slice_def->num;
+-        fmeta->slice_sz = slice_def->size;
+-        fmeta->slot_sz = 0;
+-        fmeta->file_time = dfv_rmeta_get_now();
+-        fmeta->open_cnt = 0;
+-        pthread_mutex_init(&fmeta->open_cnt_lock, NULL);
+-
+-        rmeta->fmeta_tbl[slot_id] = fmeta;
+-        dfv_rmeta_save(rmeta, repo->meta_path);
+-    }
+-
+-    assert(fmeta);
+-    fmeta->file_pos = 0;
+-
+-    // check open count
+-    pthread_mutex_lock(&fmeta->open_cnt_lock);
+-    if (fmeta->open_cnt > 0) {
+-        zlog_error(dfv_zc, "file busy: slot_id=%d, open_cnt=%d",
+-                            slot_id, fmeta->open_cnt);
+-        pthread_mutex_unlock(&fmeta->open_cnt_lock);
+-        return(NULL);
+-    }
+-    fmeta->open_cnt++;
+-    pthread_mutex_unlock(&fmeta->open_cnt_lock);
+-
+     // create ctx
+     dfv_file_t* file_ctx = NULL;
+     file_ctx = malloc(sizeof(dfv_file_t));
+     assert(file_ctx);
+     memset(file_ctx, 0, sizeof(dfv_file_t));
+-    file_ctx->repo = repo;
+-    file_ctx->slot_id = slot_id;
+-    file_ctx->fmeta = fmeta;
+-    file_ctx->dir = dir;
+-    
+-    // spawn workers
+-    for (i=0; i<fmeta->slice_num; i++) {
+-        dfv_slice_ctx_t* slice_ctx = malloc(sizeof(dfv_slice_ctx_t));
+-        assert(slice_ctx);
+-        memset(slice_ctx, 0, sizeof(dfv_slice_ctx_t));
+-        slice_ctx->slot_id = slot_id;
+-        slice_ctx->slice_id = i;
+-        slice_ctx->dir = dir;
+-        slice_ctx->fmeta = fmeta;
+-        pthread_mutex_init(&slice_ctx->lock, NULL);
+-        pthread_cond_init(&slice_ctx->not_full, NULL);
+-        pthread_cond_init(&slice_ctx->not_empty, NULL);
+-        slice_ctx->wkr_thread = malloc(sizeof(pthread_t));
+ 
+-        sprintf(pathname, "%s/%d/"DFV_SLICE_FILENAME, repo->root_path,
++    file_ctx->repo_num = repo_num;
++    for (j=0; j<repo_num; j++) {
++        // check file exists
++        dfv_repo_t* repo = slot_def->repo[j];
++        sprintf(pathname, "%s/%d", repo->root_path, slot_id);
++        rmeta = &repo->rmeta;
++        fmeta = rmeta->fmeta_tbl[slot_id];
++        if (dir == SPK_DIR_READ) {
++            if (!fmeta) {
++                zlog_error(dfv_zc, "file not found: slot_id=%d", slot_id);
++                return(NULL);
++            }
++            struct stat info;
++            if (stat(pathname, &info)) {
++                zlog_error(dfv_zc, "file entry not found: entry=%s", pathname);
++                return(NULL);
++            }
++            fmeta->total_slice_num = (fmeta->slice_num * repo_num);
++        } else {
++            // write
++            if (fmeta) {
++                zlog_error(dfv_zc, "file already exists: slot_id=%d", slot_id);
++                return(NULL);
++            }
++            if (mkdir(pathname, 0666)) {
++                zlog_error(dfv_zc, "failed to create file entry: entry=%s, errmsg=%s",
++                            pathname,
++                            strerror(errno));
++                return(NULL);
++            }
++            fmeta = malloc(sizeof(dfv_fmeta_t));
++            memset(fmeta, 0, sizeof(dfv_fmeta_t));
++            fmeta->slot_id = slot_id;
++            fmeta->total_slice_num = (slice_def->num * repo_num);
++            fmeta->slice_num = slice_def->num;
++            fmeta->slice_sz = slice_def->size;
++            fmeta->slot_sz = 0;
++            fmeta->file_time = dfv_rmeta_get_now();
++            fmeta->open_cnt = 0;
++            pthread_mutex_init(&fmeta->open_cnt_lock, NULL);
++
++            rmeta->fmeta_tbl[slot_id] = fmeta;
++            dfv_rmeta_save(rmeta, repo->meta_path);
++        }
++
++        assert(fmeta);
++        fmeta->file_pos = 0;
++
++        // check open count
++        pthread_mutex_lock(&fmeta->open_cnt_lock);
++        if (fmeta->open_cnt > 0) {
++            zlog_error(dfv_zc, "file busy: slot_id=%d, open_cnt=%d",
++                                slot_id, fmeta->open_cnt);
++            pthread_mutex_unlock(&fmeta->open_cnt_lock);
++            return(NULL);
++        }
++        fmeta->open_cnt++;
++        pthread_mutex_unlock(&fmeta->open_cnt_lock);
++
++        file_ctx->repo[j] = repo;
++        file_ctx->slot_id = slot_id;
++        file_ctx->fmeta = fmeta;
++        file_ctx->dir = dir;
++        // spawn workers
++        for (i=0; i<fmeta->slice_num; i++) {
++            int slice_index = i + (j * fmeta->slice_num);
++            dfv_slice_ctx_t* slice_ctx = malloc(sizeof(dfv_slice_ctx_t));
++            assert(slice_ctx);
++            memset(slice_ctx, 0, sizeof(dfv_slice_ctx_t));
++            slice_ctx->slot_id = slot_id;
++            slice_ctx->slice_id = slice_index;
++            slice_ctx->dir = dir;
++            slice_ctx->fmeta = fmeta;
++            pthread_mutex_init(&slice_ctx->lock, NULL);
++            pthread_cond_init(&slice_ctx->not_full, NULL);
++            pthread_cond_init(&slice_ctx->not_empty, NULL);
++            slice_ctx->wkr_thread = malloc(sizeof(pthread_t));
++            sprintf(pathname, "%s/%d/"DFV_SLICE_FILENAME, repo->root_path,
+                              slot_id, i+1);
+-        fd = open(pathname, O_CREAT | O_RDWR | O_DIRECT);
+-        if (fd < 0) {
+-            zlog_error(dfv_zc, "failed to open file: file=%s, errmsg=%s",
+-                        pathname,
+-                        strerror(errno));
+-            assert(0);
++            fd = open(pathname, O_CREAT | O_RDWR | O_DIRECT);
++            if (fd < 0) {
++                zlog_error(dfv_zc, "failed to open file: file=%s, errmsg=%s",
++                            pathname,
++                            strerror(errno));
++                assert(0);
++            }
++
++            slice_ctx->fd = fd;
++            file_ctx->slice_tbl[slice_index] = slice_ctx;
++            slice_ctx->cpu_base = cpu_base;
++            pthread_create(slice_ctx->wkr_thread, NULL,
++                             __dfv_slice_worker, slice_ctx);
+         }
+-        slice_ctx->fd = fd;
+-        file_ctx->slice_tbl[i] = slice_ctx;
+-        slice_ctx->cpu_base = cpu_base;
+-        pthread_create(slice_ctx->wkr_thread, NULL,
+-                         __dfv_slice_worker, slice_ctx);
+     }
+     
+     if (file_ctx) {
+@@ -227,14 +237,14 @@
+     dfv_fmeta_t* fmeta = file_ctx->fmeta;
+     dfv_slice_ctx_t* slice_ctx = NULL;
+ 
+-    for (i=0; i<fmeta->slice_num; i++) {
++    for (i=0; i<fmeta->total_slice_num; i++) {
+         // set quit_req flag
+         slice_ctx = file_ctx->slice_tbl[i];
+         slice_ctx->quit_req = 1;
+         pthread_cond_signal(&slice_ctx->not_empty);
+     }
+ 
+-    for (i=0; i<fmeta->slice_num; i++) {
++    for (i=0; i<fmeta->total_slice_num; i++) {
+         // wait thread quit
+         slice_ctx = file_ctx->slice_tbl[i];
+         pthread_join(*slice_ctx->wkr_thread, NULL);
+@@ -247,34 +257,39 @@
+ 
+     // update file_sz in meta
+     int remove_slot = 0;
+-    if (file_ctx->dir == SPK_DIR_WRITE) {
+-        if (file_ctx->fmeta->file_pos > 0) {
+-            ssize_t slot_sz = dfv_repo_get_slotsize(file_ctx->repo, file_ctx->slot_id);
+-            if (slot_sz < 0) {
+-                zlog_warn(dfv_zc, "can not get file size: slot_id=%d, ret=%ld",
+-                                    file_ctx->slot_id, slot_sz);
++    for(i=0; i<file_ctx->repo_num; i++) {  
++        if (file_ctx->dir == SPK_DIR_WRITE) {
++            if (file_ctx->fmeta->file_pos > 0) {
++                ssize_t slot_sz = dfv_repo_get_slotsize(file_ctx->repo[i], file_ctx->slot_id);
++                if (slot_sz < 0) {
++                    zlog_warn(dfv_zc, "can not get file size: slot_id=%d, ret=%ld",
++                                        file_ctx->slot_id, slot_sz);
++                } else {
++                    dfv_fmeta_t* repo_fmeta = file_ctx->repo[i]->rmeta.fmeta_tbl[file_ctx->slot_id];
++                    repo_fmeta->slot_sz = slot_sz;
++                    dfv_rmeta_save(&file_ctx->repo[i]->rmeta, file_ctx->repo[i]->meta_path);
++                }
+             } else {
+-                fmeta->slot_sz = slot_sz;
+-                dfv_rmeta_save(&file_ctx->repo->rmeta, file_ctx->repo->meta_path);
++                // nothing written
++                // remove this file
++                zlog_warn(dfv_zc, "file closed but nothing written: slot_id=%d",
++                                file_ctx->slot_id);
++                remove_slot = 1;
+             }
+-        } else {
+-            // nothing written
+-            // remove this file
+-            zlog_warn(dfv_zc, "file closed but nothing written: slot_id=%d",
+-                                file_ctx->slot_id);
+-            remove_slot = 1;
++
+         }
+     }
+-    
+     // dec open_cnt
+     pthread_mutex_lock(&fmeta->open_cnt_lock);
+-    fmeta->open_cnt--;
++    for(i=0; i<file_ctx->repo_num; i++) {  
++        dfv_fmeta_t* repo_fmeta = file_ctx->repo[i]->rmeta.fmeta_tbl[file_ctx->slot_id];
++        repo_fmeta->open_cnt--;
++        if (remove_slot) {
++            dfv_repo_delete(file_ctx->repo[i], file_ctx->slot_id);
++        }
++    }
+     pthread_mutex_unlock(&fmeta->open_cnt_lock);
+ 
+-    if (remove_slot) {
+-        dfv_repo_delete(file_ctx->repo, file_ctx->slot_id);
+-    }
+-
+     SAFE_RELEASE(file_ctx);
+ 
+     return(SPK_SUCCESS);
+@@ -284,7 +299,7 @@
+ {
+     dfv_fmeta_t* fmeta = file_ctx->fmeta;
+     assert(fmeta);
+-    int slice_num = fmeta->slice_num;
++    int slice_num = fmeta->total_slice_num;
+     
+ //    assert(file_ctx->dir == SPK_DIR_READ);
+ 
+@@ -315,7 +330,7 @@
+     zlog_info(dfv_zc, "file read: ctx=%p, buf=%zu@%p", file_ctx, size, buf);
+ 
+     dfv_fmeta_t* fmeta = file_ctx->fmeta;
+-    for (i=0; i<fmeta->slice_num; i++) {
++    for (i=0; i<fmeta->total_slice_num; i++) {
+         slice_ctx = file_ctx->slice_tbl[i];
+         // wait for slice worker to be idle
+         pthread_mutex_lock(&slice_ctx->lock);
+@@ -335,7 +350,7 @@
+     }
+ 
+     ret_sz = size;
+-    for (i=0; i<fmeta->slice_num; i++) {
++    for (i=0; i<fmeta->total_slice_num; i++) {
+         slice_ctx = file_ctx->slice_tbl[i];
+         // wait for slice worker to be idle
+         pthread_mutex_lock(&slice_ctx->lock);
+@@ -366,7 +381,7 @@
+ 
+     dfv_fmeta_t* fmeta = file_ctx->fmeta;
+ 
+-    for (i=0; i<fmeta->slice_num; i++) {
++    for (i=0; i<fmeta->total_slice_num; i++) {
+         slice_ctx = file_ctx->slice_tbl[i];
+         // wait for slice worker to be idle
+         pthread_mutex_lock(&slice_ctx->lock);
+@@ -386,7 +401,7 @@
+     }
+ 
+     ret_sz = size;
+-    for (i=0; i<fmeta->slice_num; i++) {
++    for (i=0; i<fmeta->total_slice_num; i++) {
+         slice_ctx = file_ctx->slice_tbl[i];
+         // wait for slice worker to be idle
+         pthread_mutex_lock(&slice_ctx->lock);
+Index: src/libdfv/dfv.h
+===================================================================
+--- src/libdfv/dfv.h	(revision 80)
++++ src/libdfv/dfv.h	(working copy)
+@@ -12,7 +12,7 @@
+ 
+ #define DFV_META_VERSION    (1)
+ 
+-#define DFV_MAX_SLICES      (8)
++#define DFV_MAX_SLICES      (32)
+ #define DFV_MAX_SECSIZE     (4*1024*1024)
+ 
+ #define DFV_PREFIX_PATH     "media"
+@@ -63,8 +63,9 @@
+ 
+ typedef struct dfv_file
+ {
+-    dfv_repo_t* repo;
++    dfv_repo_t* repo[DFV_MAX_REPOS];
+     int slot_id;
++    int repo_num;
+     int dir;
+     dfv_fmeta_t* fmeta;
+     dfv_slice_ctx_t* slice_tbl[DFV_MAX_SLICES];
